@@ -472,6 +472,153 @@ def api_overview_graph():
             "legend": [{"group": k, "color": v} for k, v in GROUP_COLORS.items()]}
 
 
+@app.get("/api/graph")
+def api_tab_graph(tab: str = Query("sales")):
+    import psycopg2, psycopg2.extras
+    DB = {"host":"127.0.0.1","port":5432,"database":"ckd_next","user":"postgres","password":"1234"}
+    conn = psycopg2.connect(**DB, cursor_factory=psycopg2.extras.RealDictCursor)
+    cur = conn.cursor()
+    nodes, edges = [], []
+    node_set = set()
+    COLORS = {
+        "Customer":"#58a6ff","SalesOrder":"#3fb950","BillingDocument":"#d29922",
+        "Material":"#58a6ff","DeviationReport":"#f85149","CapaAction":"#bc8cff","InspectionLot":"#ffa657",
+        "ProductionOrder":"#d29922","Vendor":"#3fb950","PurchaseOrder":"#ffa657",
+        "System":"#ff9500","Alert":"#f85149","Action":"#bc8cff","Finance":"#58a6ff","Production":"#3fb950",
+    }
+    def add_node(nid, label, group, title=""):
+        if nid not in node_set:
+            node_set.add(nid)
+            col = COLORS.get(group, "#8b949e")
+            nodes.append({"id":nid,"label":label,"group":group,"title":title or label,
+                "color":{"background":col,"border":"#ffffff44","highlight":{"background":col,"border":"#fff"}},
+                "font":{"color":"#fff","size":13,"bold":True,"strokeWidth":2,"strokeColor":"#00000099"},
+                "shape":"ellipse","borderWidth":2})
+    def add_edge(from_id, to_id, label=""):
+        edges.append({"id":len(edges),"from":from_id,"to":to_id,"label":label,
+            "arrows":{"to":{"enabled":True,"scaleFactor":0.7}},
+            "color":{"color":"#ffffff44","highlight":"#fff"},
+            "font":{"color":"#ccc","size":10,"align":"middle","strokeWidth":2,"strokeColor":"#0d1117"},
+            "smooth":{"type":"curvedCW","roundness":0.2},"width":1.5})
+
+    if tab == "sales":
+        cur.execute("SELECT customer_id, customer_name FROM customer_master ORDER BY customer_id LIMIT 8")
+        custs = cur.fetchall()
+        for c in custs:
+            lbl = (c['customer_name'] or '')[:12] or f"C{c['customer_id']}"
+            add_node(f"C:{c['customer_id']}", lbl, "Customer")
+        if custs:
+            cids = tuple(c['customer_id'] for c in custs)
+            ph = ",".join(["%s"]*len(cids))
+            cur.execute(f"SELECT order_id, order_no, customer_id, overall_status FROM sales_order WHERE customer_id IN ({ph}) LIMIT 12", cids)
+            for r in cur.fetchall():
+                nid = f"SO:{r['order_id']}"
+                add_node(nid, r['order_no'], "SalesOrder", f"상태:{r['overall_status']}")
+                add_edge(f"C:{r['customer_id']}", nid, "수주")
+        cur.execute("SELECT billing_id, billing_type, sold_to_party FROM billing_document LIMIT 10")
+        for r in cur.fetchall():
+            nid = f"BL:{r['billing_id']}"
+            add_node(nid, r['billing_id'], "BillingDocument", f"유형:{r['billing_type']}")
+            cnid = f"C:{r['sold_to_party']}"
+            if cnid in node_set:
+                add_edge(cnid, nid, "청구")
+
+    elif tab == "quality":
+        cur.execute("""
+            SELECT mm.material_no, COALESCE(md.material_desc, mm.material_no) AS desc
+            FROM material_master mm
+            LEFT JOIN material_description md ON md.material_id=mm.material_id AND md.language_code='KO'
+            ORDER BY mm.material_id LIMIT 8
+        """)
+        mats = cur.fetchall(); mnos = [r['material_no'] for r in mats]
+        for r in mats:
+            add_node(f"M:{r['material_no']}", r['material_no'], "Material", r['desc'])
+        if mnos:
+            ph = ",".join(["%s"]*len(mnos))
+            cur.execute(f"SELECT deviation_id, material_id, severity, status, capa_id FROM deviation_report WHERE material_id IN ({ph}) LIMIT 12", tuple(mnos))
+            devs = cur.fetchall(); capa_map = {}
+            for r in devs:
+                nid = f"D:{r['deviation_id']}"
+                add_node(nid, r['deviation_id'], "DeviationReport", f"심각:{r['severity']} {r['status']}")
+                add_edge(f"M:{r['material_id']}", nid, "일탈")
+                if r['capa_id']: capa_map[r['capa_id']] = nid
+            if capa_map:
+                ph2 = ",".join(["%s"]*len(capa_map))
+                cur.execute(f"SELECT action_id, capa_id, action_type, status FROM capa_action WHERE capa_id IN ({ph2}) LIMIT 10", tuple(capa_map))
+                for r in cur.fetchall():
+                    nid = f"CA:{r['action_id']}"
+                    add_node(nid, f"CAPA {r['action_id']}", "CapaAction", f"{r['action_type']} {r['status']}")
+                    dev = capa_map.get(r['capa_id'])
+                    if dev: add_edge(dev, nid, "조치")
+        cur.execute("SELECT lot_id, material_id, lot_origin FROM qm_inspection_lot LIMIT 8")
+        for r in cur.fetchall():
+            nid = f"L:{r['lot_id']}"
+            add_node(nid, r['lot_id'], "InspectionLot", f"기원:{r['lot_origin']}")
+            mnid = f"M:{r['material_id']}"
+            if mnid in node_set: add_edge(mnid, nid, "검사")
+
+    elif tab == "production":
+        cur.execute("""
+            SELECT mm.material_no, COALESCE(md.material_desc, mm.material_no) AS desc
+            FROM material_master mm
+            LEFT JOIN material_description md ON md.material_id=mm.material_id AND md.language_code='KO'
+            ORDER BY mm.material_id LIMIT 8
+        """)
+        mats = cur.fetchall(); mnos = [r['material_no'] for r in mats]
+        for r in mats:
+            add_node(f"M:{r['material_no']}", r['material_no'], "Material", r['desc'])
+        if mnos:
+            ph = ",".join(["%s"]*len(mnos))
+            cur.execute(f"SELECT prod_order_id, material_id, status FROM production_order WHERE material_id IN ({ph}) LIMIT 10", tuple(mnos))
+            for r in cur.fetchall():
+                nid = f"PO:{r['prod_order_id']}"
+                add_node(nid, r['prod_order_id'], "ProductionOrder", f"상태:{r['status']}")
+                add_edge(f"M:{r['material_id']}", nid, "생산")
+        cur.execute("SELECT vendor_id, vendor_name FROM vendor_master ORDER BY vendor_id LIMIT 6")
+        vends = cur.fetchall(); vids = [r['vendor_id'] for r in vends]
+        for r in vends:
+            add_node(f"V:{r['vendor_id']}", (r['vendor_name'] or r['vendor_id'])[:14], "Vendor")
+        if vids:
+            ph = ",".join(["%s"]*len(vids))
+            cur.execute(f"""
+                SELECT po.po_id, po.vendor_id, poi.material_id
+                FROM purchase_order po JOIN purchase_order_item poi ON poi.po_id=po.po_id
+                WHERE po.vendor_id IN ({ph}) LIMIT 12
+            """, tuple(vids))
+            for r in cur.fetchall():
+                nid = f"PU:{r['po_id']}"
+                add_node(nid, r['po_id'], "PurchaseOrder")
+                add_edge(f"V:{r['vendor_id']}", nid, "공급")
+                mnid = f"M:{r['material_id']}"
+                if mnid in node_set: add_edge(nid, mnid, "원자재")
+
+    elif tab == "monitor":
+        add_node("SYS", "CKD-NEXT", "System", "운영 모니터링 허브")
+        cur.execute("SELECT deviation_id, severity, status FROM deviation_report WHERE severity='CRITICAL' AND status NOT IN ('CLOSED','CANCELLED') LIMIT 6")
+        for r in cur.fetchall():
+            nid = f"D:{r['deviation_id']}"
+            add_node(nid, r['deviation_id'], "Alert", f"Critical [{r['status']}]")
+            add_edge("SYS", nid, "Critical")
+        cur.execute("SELECT action_id, capa_id, status FROM capa_action WHERE status NOT IN ('COMPLETED','CANCELLED') LIMIT 5")
+        for r in cur.fetchall():
+            nid = f"CA:{r['action_id']}"
+            add_node(nid, f"CAPA {r['action_id']}", "Action", f"{r['status']} [{r['capa_id']}]")
+            add_edge("SYS", nid, "미완료 CAPA")
+        cur.execute("SELECT ar_id, customer_id, open_amount FROM accounts_receivable WHERE ar_status='OPEN' AND open_amount>0 LIMIT 5")
+        for r in cur.fetchall():
+            nid = f"AR:{r['ar_id']}"
+            add_node(nid, f"AR {r['ar_id']}", "Finance", f"미수 ₩{float(r['open_amount']):,.0f}")
+            add_edge("SYS", nid, "미수채권")
+        cur.execute("SELECT prod_order_id, material_id, status FROM production_order WHERE status IN ('REL','PCNF') LIMIT 5")
+        for r in cur.fetchall():
+            nid = f"PROD:{r['prod_order_id']}"
+            add_node(nid, r['prod_order_id'], "Production", f"생산중 [{r['status']}]")
+            add_edge("SYS", nid, "진행생산")
+
+    conn.close()
+    return {"nodes": nodes, "edges": edges}
+
+
 DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html lang="ko">
@@ -844,6 +991,12 @@ DASHBOARD_HTML = r"""
           <tbody id="apTable"></tbody>
         </table>
       </div>
+      <div class="card" style="margin-top:16px;">
+        <div class="card-title"><span class="icon">🕸️</span>고객·수주·청구 연관 그래프
+          <span id="sales-g-legend" style="margin-left:12px;font-size:11px;color:var(--text2);"></span>
+        </div>
+        <div id="sales-g-canvas" style="width:100%;height:500px;background:var(--bg);border-radius:8px;overflow:hidden;border:1px solid var(--border);margin-top:8px;"></div>
+      </div>
     </div>
   </div>
 
@@ -909,6 +1062,12 @@ DASHBOARD_HTML = r"""
         <div class="card-title"><span class="icon">✅</span>CAPA 현황</div>
         <div id="capaStatus"></div>
       </div>
+      <div class="card" style="margin-top:16px;">
+        <div class="card-title"><span class="icon">🕸️</span>자재·일탈·CAPA·검사 연관 그래프
+          <span id="quality-g-legend" style="margin-left:12px;font-size:11px;color:var(--text2);"></span>
+        </div>
+        <div id="quality-g-canvas" style="width:100%;height:500px;background:var(--bg);border-radius:8px;overflow:hidden;border:1px solid var(--border);margin-top:8px;"></div>
+      </div>
     </div>
   </div>
 
@@ -963,6 +1122,12 @@ DASHBOARD_HTML = r"""
         <tbody id="lotTable2"></tbody>
       </table>
     </div>
+    <div class="card" style="margin-top:16px;">
+      <div class="card-title"><span class="icon">🕸️</span>자재·생산오더·공급사·구매오더 연관 그래프
+        <span id="prod-g-legend" style="margin-left:12px;font-size:11px;color:var(--text2);"></span>
+      </div>
+      <div id="prod-g-canvas" style="width:100%;height:500px;background:var(--bg);border-radius:8px;overflow:hidden;border:1px solid var(--border);margin-top:8px;"></div>
+    </div>
   </div>
 
   <!-- ══════════════════════════════════════════
@@ -1011,6 +1176,12 @@ DASHBOARD_HTML = r"""
       <div class="card">
         <div class="card-title"><span class="icon">💹</span>실시간 재무 지표</div>
         <div id="finMonitor"></div>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <div class="card-title"><span class="icon">🕸️</span>운영 현황 허브 그래프 (Critical 일탈·CAPA·미수채권·생산)
+          <span id="mon-g-legend" style="margin-left:12px;font-size:11px;color:var(--text2);"></span>
+        </div>
+        <div id="mon-g-canvas" style="width:100%;height:500px;background:var(--bg);border-radius:8px;overflow:hidden;border:1px solid var(--border);margin-top:8px;"></div>
       </div>
     </div>
   </div>
@@ -1362,6 +1533,53 @@ async function loadOverviewGraph() {
     const cx = (Math.min(...xs)+Math.max(...xs))/2, cy = (Math.min(...ys)+Math.max(...ys))/2;
     const xRange = Math.max(...xs)-Math.min(...xs)+80;
     const yRange = Math.max(...ys)-Math.min(...ys)+80;
+    const scale = Math.min((c.offsetWidth-40)/xRange, (c.offsetHeight-60)/yRange, 2.5);
+    net.moveTo({ position:{x:cx,y:cy}, scale, animation:false });
+  }, 400));
+}
+
+async function loadTabGraph(tab, canvasId, netKey) {
+  const container = document.getElementById(canvasId);
+  if (!container) return;
+  if (window[netKey]) { try { window[netKey].destroy(); } catch(e){} window[netKey] = null; }
+  container.innerHTML = '<div style="color:var(--text-dim);padding:20px;text-align:center;">그래프 로딩 중...</div>';
+
+  let d;
+  try {
+    const r = await fetch(`/api/graph?tab=${tab}`);
+    d = await r.json();
+  } catch(e) {
+    container.innerHTML = `<div style="color:#f85149;padding:20px;">로딩 실패: ${e}</div>`;
+    return;
+  }
+  container.innerHTML = '';
+  if (!d.nodes || !d.nodes.length) {
+    container.innerHTML = '<div style="color:var(--text-dim);padding:20px;text-align:center;">데이터 없음</div>';
+    return;
+  }
+
+  await new Promise(res => setTimeout(res, 120));
+  const net = new vis.Network(container,
+    { nodes: new vis.DataSet(d.nodes), edges: new vis.DataSet(d.edges) },
+    { physics: { barnesHut: { gravitationalConstant: -5000, springLength: 130, springConstant: 0.06, damping: 0.35 },
+        stabilization: { iterations: 220 } },
+      interaction: { hover: true, navigationButtons: true, zoomView: true },
+      nodes: { borderWidth: 2, size: 18 },
+      edges: { width: 1.5 },
+    });
+  window[netKey] = net;
+
+  net.once('stabilizationIterationsDone', () => setTimeout(() => {
+    const c = document.getElementById(canvasId);
+    if (!c) return;
+    net.setSize(c.offsetWidth + 'px', c.offsetHeight + 'px');
+    net.redraw();
+    const pos = net.getPositions();
+    const keys = Object.keys(pos);
+    if (!keys.length) return;
+    const xs = keys.map(k => pos[k].x), ys = keys.map(k => pos[k].y);
+    const cx = (Math.min(...xs)+Math.max(...xs))/2, cy = (Math.min(...ys)+Math.max(...ys))/2;
+    const xRange = Math.max(...xs)-Math.min(...xs)+80, yRange = Math.max(...ys)-Math.min(...ys)+80;
     const scale = Math.min((c.offsetWidth-40)/xRange, (c.offsetHeight-60)/yRange, 2.5);
     net.moveTo({ position:{x:cx,y:cy}, scale, animation:false });
   }, 400));
@@ -1728,7 +1946,8 @@ function miniStat(label, val, isAlert) {
 // ──────────────────────────────────────────
 // KG 패널 데이터 로딩
 // ──────────────────────────────────────────
-let _kgLoaded = {ontology:false, kgraph:false, neo4j:false, vectorrag:false};
+let _kgLoaded = {ontology:false, kgraph:false, neo4j:false, vectorrag:false,
+                 graphrag:false, sales:false, quality:false, production:false, monitor:false};
 let _visNetwork = null;
 let _vrDistChart = null;
 let _vrCypherText = '';
@@ -1740,10 +1959,16 @@ function showPanel(name, tab) {
   if (tab) tab.classList.add('active');
   if (kpiData) renderCharts(kpiData);
   // KG 패널 지연 로딩
-  if (name === 'ontology' && !_kgLoaded.ontology) { loadOntology(); _kgLoaded.ontology=true; }
-  if (name === 'kgraph'   && !_kgLoaded.kgraph)   { loadKGraph();   _kgLoaded.kgraph=true;   }
-  if (name === 'neo4j'    && !_kgLoaded.neo4j)    { loadNeo4j();    _kgLoaded.neo4j=true;    }
-  if (name === 'vectorrag'&& !_kgLoaded.vectorrag) { loadVectorRAG();_kgLoaded.vectorrag=true;}
+  if (name === 'ontology'    && !_kgLoaded.ontology)    { loadOntology();    _kgLoaded.ontology=true;    }
+  if (name === 'kgraph'      && !_kgLoaded.kgraph)      { loadKGraph();      _kgLoaded.kgraph=true;      }
+  if (name === 'neo4j'       && !_kgLoaded.neo4j)       { loadNeo4j();       _kgLoaded.neo4j=true;       }
+  if (name === 'vectorrag'   && !_kgLoaded.vectorrag)   { loadVectorRAG();   _kgLoaded.vectorrag=true;   }
+  if (name === 'graphrag'    && !_kgLoaded.graphrag)    { runGraphRAG();     _kgLoaded.graphrag=true;    }
+  // 비즈니스 탭 그래프 지연 로딩
+  if (name === 'sales'       && !_kgLoaded.sales)       { loadTabGraph('sales',      'sales-g-canvas',  '_salesNet');  _kgLoaded.sales=true;       }
+  if (name === 'quality'     && !_kgLoaded.quality)     { loadTabGraph('quality',    'quality-g-canvas','_qualNet');   _kgLoaded.quality=true;     }
+  if (name === 'production'  && !_kgLoaded.production)  { loadTabGraph('production', 'prod-g-canvas',   '_prodNet');   _kgLoaded.production=true;  }
+  if (name === 'monitor'     && !_kgLoaded.monitor)     { loadTabGraph('monitor',    'mon-g-canvas',    '_monNet');    _kgLoaded.monitor=true;     }
 }
 
 // ── OWL 온톨로지 ──
