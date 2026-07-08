@@ -345,6 +345,133 @@ def api_graphrag_query(q: str = Query("Critical 일탈 CAPA 현황"), top_k: int
     return _graphrag_mod.graphrag_query(q, top_k=top_k)
 
 
+@app.get("/api/overview-graph")
+def api_overview_graph():
+    import psycopg2, psycopg2.extras
+    DB = {"host":"127.0.0.1","port":5432,"database":"ckd_next","user":"postgres","password":"1234"}
+    conn = psycopg2.connect(**DB, cursor_factory=psycopg2.extras.RealDictCursor)
+    cur = conn.cursor()
+
+    nodes, edges = [], []
+    node_ids = set()
+
+    def add_node(nid, label, group, title=""):
+        if nid not in node_ids:
+            node_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "group": group, "title": title or label})
+
+    # 자재 (상위 8개) — material_no를 키로 사용 (prod/dev 테이블과 공통)
+    cur.execute("""
+        SELECT mm.material_id, mm.material_no, COALESCE(md.material_desc, mm.material_no) AS desc
+        FROM material_master mm
+        LEFT JOIN material_description md ON md.material_id=mm.material_id AND md.language_code='KO'
+        ORDER BY mm.material_id LIMIT 8
+    """)
+    mat_rows = cur.fetchall()
+    mat_by_no  = {}   # material_no  → nid
+    mat_by_iid = {}   # material_id(int) → nid
+    for r in mat_rows:
+        nid = f"MAT:{r['material_id']}"
+        add_node(nid, r['material_no'], "Material", r['desc'])
+        mat_by_no[r['material_no']] = nid
+        mat_by_iid[r['material_id']] = nid
+    mnos = tuple(mat_by_no.keys())
+    miids = tuple(mat_by_iid.keys())
+
+    # 수주 → 자재 연결 (sales_order_item.material_id = int)
+    if miids:
+        ph = ",".join(["%s"]*len(miids))
+        cur.execute(f"""
+            SELECT DISTINCT so.order_id, so.order_no, so.overall_status, soi.material_id
+            FROM sales_order so JOIN sales_order_item soi ON soi.order_id=so.order_id
+            WHERE soi.material_id IN ({ph}) LIMIT 10
+        """, miids)
+        for r in cur.fetchall():
+            nid = f"SO:{r['order_id']}"
+            add_node(nid, r['order_no'] or f"SO:{r['order_id']}", "SalesOrder", f"상태:{r['overall_status']}")
+            mid_nid = mat_by_iid.get(r['material_id'])
+            if mid_nid:
+                edges.append({"from": mid_nid, "to": nid, "label": "contains"})
+
+    # 생산오더 → 자재 연결 (production_order.material_id = material_no 형식)
+    if mnos:
+        ph2 = ",".join(["%s"]*len(mnos))
+        cur.execute(f"""
+            SELECT prod_order_id, material_id, status
+            FROM production_order WHERE material_id IN ({ph2}) LIMIT 10
+        """, mnos)
+        po_ids = []   # (prod_order_id, nid)
+        for r in cur.fetchall():
+            nid = f"PO:{r['prod_order_id']}"
+            add_node(nid, r['prod_order_id'], "ProductionOrder", f"상태:{r['status']}")
+            mid_nid = mat_by_no.get(r['material_id'])
+            if mid_nid:
+                edges.append({"from": mid_nid, "to": nid, "label": "produces"})
+            po_ids.append((r['prod_order_id'], nid))
+
+    # 일탈 → 자재 연결 (deviation_report.material_id = material_no 형식)
+    if mnos:
+        cur.execute(f"""
+            SELECT deviation_id, material_id, severity, status, capa_id
+            FROM deviation_report WHERE material_id IN ({ph2}) LIMIT 10
+        """, mnos)
+        dev_rows = cur.fetchall()
+        dev_by_capaid = {}   # capa_id → dev nid
+        for r in dev_rows:
+            nid = f"DEV:{r['deviation_id']}"
+            add_node(nid, r['deviation_id'], "DeviationReport", f"심각도:{r['severity']} 상태:{r['status']}")
+            mid_nid = mat_by_no.get(r['material_id'])
+            if mid_nid:
+                edges.append({"from": mid_nid, "to": nid, "label": "hasDeviation"})
+            if r['capa_id']:
+                dev_by_capaid[r['capa_id']] = nid
+
+        # CAPA → 일탈 (capa_action.capa_id = deviation_report.capa_id)
+        if dev_by_capaid:
+            cids = tuple(dev_by_capaid.keys())
+            ph3 = ",".join(["%s"]*len(cids))
+            cur.execute(f"""
+                SELECT action_id, capa_id, action_type, status
+                FROM capa_action WHERE capa_id IN ({ph3}) LIMIT 10
+            """, cids)
+            for r in cur.fetchall():
+                nid = f"CAPA:{r['action_id']}"
+                add_node(nid, f"CAPA {r['action_id']}", "CapaAction", f"유형:{r['action_type']} 상태:{r['status']}")
+                dev_nid = dev_by_capaid.get(r['capa_id'])
+                if dev_nid:
+                    edges.append({"from": dev_nid, "to": nid, "label": "hasCapa"})
+
+    conn.close()
+
+    GROUP_COLORS = {
+        "Material":        "#58a6ff",
+        "SalesOrder":      "#3fb950",
+        "ProductionOrder": "#d29922",
+        "DeviationReport": "#f85149",
+        "CapaAction":      "#bc8cff",
+    }
+    for n in nodes:
+        col = GROUP_COLORS.get(n["group"], "#8b949e")
+        n["color"] = {"background": col, "border": "#ffffff44",
+                      "highlight": {"background": col, "border": "#fff"}}
+        n["font"] = {"color": "#fff", "size": 13, "bold": True,
+                     "strokeWidth": 2, "strokeColor": "#00000099"}
+        n["shape"] = "ellipse"
+        n["borderWidth"] = 2
+
+    for i, e in enumerate(edges):
+        e["id"] = i
+        e["arrows"] = {"to": {"enabled": True, "scaleFactor": 0.7}}
+        e["color"] = {"color": "#ffffff44", "highlight": "#fff"}
+        e["font"] = {"color": "#ccc", "size": 10, "align": "middle",
+                     "strokeWidth": 2, "strokeColor": "#0d1117"}
+        e["smooth"] = {"type": "curvedCW", "roundness": 0.2}
+        e["width"] = 1.5
+
+    return {"nodes": nodes, "edges": edges,
+            "legend": [{"group": k, "color": v} for k, v in GROUP_COLORS.items()]}
+
+
 DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html lang="ko">
@@ -651,6 +778,19 @@ DASHBOARD_HTML = r"""
           <tbody id="jvTable"></tbody>
         </table>
       </div>
+    </div>
+
+    <div class="card" style="margin-top:16px;">
+      <div class="card-title"><span class="icon">🕸️</span>비즈니스 프로세스 연관 그래프 (자재 → 수주 / 생산 → 일탈 → CAPA)
+        <span style="margin-left:12px;font-size:11px;color:var(--text2);">
+          <span style="color:#58a6ff">■</span> 자재
+          <span style="color:#3fb950;margin-left:6px">■</span> 수주
+          <span style="color:#d29922;margin-left:6px">■</span> 생산오더
+          <span style="color:#f85149;margin-left:6px">■</span> 일탈
+          <span style="color:#bc8cff;margin-left:6px">■</span> CAPA
+        </span>
+      </div>
+      <div id="ov-graph-canvas" style="width:100%;height:600px;background:var(--bg);border-radius:8px;overflow:hidden;border:1px solid var(--border);margin-top:8px;"></div>
     </div>
   </div>
 
@@ -1184,6 +1324,47 @@ function renderOverview(d) {
   renderDevTable('devTable', d.recent_deviations || [], 6);
   // 전표 테이블
   renderJvTable('jvTable', d.recent_journals || [], 8);
+  // 비즈니스 프로세스 그래프
+  loadOverviewGraph();
+}
+
+async function loadOverviewGraph() {
+  const container = document.getElementById('ov-graph-canvas');
+  if (!container) return;
+  if (window._ovNet) { window._ovNet.destroy(); window._ovNet = null; }
+
+  const r = await fetch('/api/overview-graph');
+  const d = await r.json();
+
+  const ovNodes = new vis.DataSet(d.nodes || []);
+  const ovEdges = new vis.DataSet(d.edges || []);
+
+  await new Promise(res => setTimeout(res, 150));
+  const net = new vis.Network(container, { nodes: ovNodes, edges: ovEdges }, {
+    physics: {
+      barnesHut: { gravitationalConstant: -4000, springLength: 120, springConstant: 0.06, damping: 0.4 },
+      stabilization: { iterations: 200 }
+    },
+    interaction: { hover: true, navigationButtons: true, zoomView: true },
+    nodes: { borderWidth: 2, size: 20 },
+    edges: { width: 1.5 },
+  });
+  window._ovNet = net;
+
+  net.once('stabilizationIterationsDone', () => setTimeout(() => {
+    const c = document.getElementById('ov-graph-canvas');
+    net.setSize(c.offsetWidth + 'px', c.offsetHeight + 'px');
+    net.redraw();
+    const pos = net.getPositions();
+    const keys = Object.keys(pos);
+    if (!keys.length) return;
+    const xs = keys.map(k => pos[k].x), ys = keys.map(k => pos[k].y);
+    const cx = (Math.min(...xs)+Math.max(...xs))/2, cy = (Math.min(...ys)+Math.max(...ys))/2;
+    const xRange = Math.max(...xs)-Math.min(...xs)+80;
+    const yRange = Math.max(...ys)-Math.min(...ys)+80;
+    const scale = Math.min((c.offsetWidth-40)/xRange, (c.offsetHeight-60)/yRange, 2.5);
+    net.moveTo({ position:{x:cx,y:cy}, scale, animation:false });
+  }, 400));
 }
 
 function renderSales(d) {
