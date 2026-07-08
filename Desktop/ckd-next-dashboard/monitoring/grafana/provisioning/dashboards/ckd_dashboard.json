@@ -1,0 +1,66 @@
+{
+  "id": null,
+  "title": "CKD-NEXT 운영 대시보드",
+  "tags": ["ckd-next"],
+  "timezone": "Asia/Seoul",
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "CDC 이벤트 총계",
+      "gridPos": {"x":0,"y":0,"w":4,"h":4},
+      "targets": [{"expr":"sum(ckd_cdc_events_total)","legendFormat":"total"}],
+      "datasource": "Prometheus"
+    },
+    {
+      "id": 2, "type": "stat", "title": "Redis Stream 메시지",
+      "gridPos": {"x":4,"y":0,"w":4,"h":4},
+      "targets": [{"expr":"ckd_redis_stream_length","legendFormat":"msgs"}],
+      "datasource": "Prometheus"
+    },
+    {
+      "id": 3, "type": "stat", "title": "WebSocket 클라이언트",
+      "gridPos": {"x":8,"y":0,"w":4,"h":4},
+      "targets": [{"expr":"ckd_websocket_connections","legendFormat":"clients"}],
+      "datasource": "Prometheus"
+    },
+    {
+      "id": 4, "type": "stat", "title": "Critical 일탈",
+      "gridPos": {"x":12,"y":0,"w":4,"h":4},
+      "targets": [{"expr":"ckd_kpi_critical_deviations","legendFormat":"critical"}],
+      "datasource": "Prometheus",
+      "options": {"thresholds": {"steps": [{"color":"green","value":0},{"color":"red","value":1}]}}
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "CDC 이벤트 테이블별 rate (1m)",
+      "gridPos": {"x":0,"y":4,"w":12,"h":8},
+      "targets": [{"expr":"rate(ckd_cdc_events_total[1m])","legendFormat":"{{table_name}}/{{operation}}"}],
+      "datasource": "Prometheus"
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Redis Stream / 수주 / 일탈 추이",
+      "gridPos": {"x":12,"y":4,"w":12,"h":8},
+      "targets": [
+        {"expr":"ckd_redis_stream_length","legendFormat":"Redis Stream"},
+        {"expr":"ckd_kpi_sales_orders","legendFormat":"수주"},
+        {"expr":"ckd_kpi_deviations","legendFormat":"일탈"}
+      ],
+      "datasource": "Prometheus"
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "AR 미수금 (KRW)",
+      "gridPos": {"x":0,"y":12,"w":12,"h":6},
+      "targets": [{"expr":"ckd_kpi_ar_open_krw","legendFormat":"AR 미수금"}],
+      "datasource": "Prometheus"
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "CDC 이벤트 operation별 rate",
+      "gridPos": {"x":12,"y":12,"w":12,"h":6},
+      "targets": [
+        {"expr":"sum by(operation)(rate(ckd_cdc_events_total[1m]))","legendFormat":"{{operation}}"}
+      ],
+      "datasource": "Prometheus"
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

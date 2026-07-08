@@ -70,6 +70,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── 관측성: Prometheus 메트릭 ──────────────────────────────────────────────
+from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST, REGISTRY
+
+def _get_or_create(cls, name, doc, labelnames=()):
+    try:
+        return cls(name, doc, labelnames) if labelnames else cls(name, doc)
+    except ValueError:
+        collectors = list(REGISTRY._names_to_collectors.get(name, {None: None}).values())
+        return collectors[0] if collectors else cls(name, doc, labelnames) if labelnames else cls(name, doc)
+
+_m_cdc_total    = _get_or_create(Counter, 'ckd_cdc_events_total',        'CDC events captured',       ('table_name', 'operation'))
+_m_redis_stream = _get_or_create(Gauge,   'ckd_redis_stream_length',      'Redis Stream total messages')
+_m_redis_alerts = _get_or_create(Gauge,   'ckd_redis_alerts_count',       'Redis critical alerts count')
+_m_ws_conns     = _get_or_create(Gauge,   'ckd_websocket_connections',    'Active WebSocket clients')
+_m_kpi_so       = _get_or_create(Gauge,   'ckd_kpi_sales_orders',        'Sales orders total')
+_m_kpi_dev      = _get_or_create(Gauge,   'ckd_kpi_deviations',          'Deviation reports total')
+_m_kpi_critical = _get_or_create(Gauge,   'ckd_kpi_critical_deviations', 'Critical deviation count')
+_m_kpi_ar       = _get_or_create(Gauge,   'ckd_kpi_ar_open_krw',         'AR open amount KRW')
+_m_kpi_prod     = _get_or_create(Gauge,   'ckd_kpi_production_orders',   'Production orders total')
+
+# ── OpenTelemetry 기본 트레이서 ────────────────────────────────────────────
+try:
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.resources import Resource, SERVICE_NAME
+    _otel_provider = TracerProvider(resource=Resource.create({SERVICE_NAME: "ckd-next-dashboard"}))
+    trace.set_tracer_provider(_otel_provider)
+    _otel_tracer = trace.get_tracer("ckd.dashboard")
+except Exception:
+    _otel_tracer = None
+
 DB_CONFIG = {
     "host": "127.0.0.1",
     "port": 5432,
@@ -274,9 +305,11 @@ class ConnectionManager:
     async def connect(self, ws: WebSocket):
         await ws.accept()
         self.active.append(ws)
+        _m_ws_conns.set(len(self.active))
 
     def disconnect(self, ws: WebSocket):
         self.active.remove(ws)
+        _m_ws_conns.set(len(self.active))
 
     async def broadcast(self, data: dict):
         msg = json.dumps(data, default=str, ensure_ascii=False)
@@ -295,10 +328,14 @@ async def _redis_pubsub_broadcaster():
     async def _on_msg(data: str):
         try:
             payload = json.loads(data)
+            tbl = payload.get("table", payload.get("topic", "unknown").split(".")[-1])
+            op  = payload.get("op", "unknown")
+            _m_cdc_total.labels(table_name=tbl, operation=op).inc()
             await manager.broadcast({
                 "type":    "cdc_event",
                 "topic":   payload.get("topic", ""),
-                "op":      payload.get("op", ""),
+                "table":   tbl,
+                "op":      op,
                 "summary": payload.get("summary", ""),
                 "ts":      payload.get("ts", 0),
             })
@@ -337,11 +374,28 @@ async def api_kpis():
     if _REDIS_ENABLED:
         cached = await _rc.get_kpi_cache()
         if cached:
+            _update_kpi_gauges(cached)
             return cached
     data = fetch_kpis()
+    _update_kpi_gauges(data)
     if _REDIS_ENABLED:
         await _rc.set_kpi_cache(data)
     return data
+
+
+def _update_kpi_gauges(data: dict):
+    try:
+        s   = data.get("sales", {})
+        dev = data.get("quality_deviation", {})
+        ar  = data.get("finance_ar", {})
+        po  = data.get("production", {})
+        _m_kpi_so.set(s.get("total_orders", 0) or 0)
+        _m_kpi_dev.set(dev.get("total_deviations", 0) or 0)
+        _m_kpi_critical.set(dev.get("critical", 0) or 0)
+        _m_kpi_ar.set(float(ar.get("ar_open", 0) or 0))
+        _m_kpi_prod.set(po.get("total_orders", 0) or 0)
+    except Exception:
+        pass
 
 
 @app.get("/")
@@ -353,9 +407,18 @@ def dashboard():
 # Redis / Kafka 상태 API
 # ══════════════════════════════════════════════════════════════
 
+@app.get("/metrics", response_class=PlainTextResponse)
+async def prometheus_metrics():
+    _m_ws_conns.set(len(manager.active))
+    return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.get("/api/infra/status")
 async def api_infra_status():
     redis_info = await _rc.redis_info() if _REDIS_ENABLED else {"available": False}
+    if redis_info.get("available"):
+        _m_redis_stream.set(redis_info.get("stream_len", 0))
+        _m_redis_alerts.set(redis_info.get("alerts_count", 0))
     return {
         "redis": redis_info,
         "kafka": {
@@ -1558,6 +1621,41 @@ DASHBOARD_HTML = r"""
       <div style="display:flex;gap:12px;margin-top:12px;flex-wrap:wrap;" id="infra-status-cards"></div>
     </div>
 
+    <!-- ── 실시간 메트릭 그래프 ── -->
+    <div class="card" style="margin-top:12px;">
+      <div class="card-title"><span class="icon">📈</span>실시간 메트릭 그래프 (Prometheus 수집 기반)</div>
+      <div class="grid-2" style="gap:14px;margin-bottom:14px;">
+        <div style="background:#0d1117;border-radius:8px;padding:12px;border:1px solid var(--border);">
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;font-weight:600;">⚡ CDC 이벤트 누적 추이</div>
+          <div style="position:relative;height:140px;"><canvas id="chart-cdc-timeline"></canvas></div>
+        </div>
+        <div style="background:#0d1117;border-radius:8px;padding:12px;border:1px solid var(--border);">
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;font-weight:600;">🗄️ Redis Stream 메시지 성장</div>
+          <div style="position:relative;height:140px;"><canvas id="chart-redis-stream"></canvas></div>
+        </div>
+      </div>
+      <div class="grid-2" style="gap:14px;margin-bottom:14px;">
+        <div style="background:#0d1117;border-radius:8px;padding:12px;border:1px solid var(--border);">
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;font-weight:600;">🔁 INSERT / UPDATE / DELETE 분포</div>
+          <div style="position:relative;height:140px;"><canvas id="chart-event-donut"></canvas></div>
+        </div>
+        <div style="background:#0d1117;border-radius:8px;padding:12px;border:1px solid var(--border);">
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;font-weight:600;">📋 테이블별 이벤트 수</div>
+          <div style="position:relative;height:140px;"><canvas id="chart-table-bar"></canvas></div>
+        </div>
+      </div>
+      <div class="grid-2" style="gap:14px;">
+        <div style="background:#0d1117;border-radius:8px;padding:12px;border:1px solid var(--border);">
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;font-weight:600;">📊 KPI 트렌드 (수주 / 일탈 / Critical)</div>
+          <div style="position:relative;height:140px;"><canvas id="chart-kpi-trend"></canvas></div>
+        </div>
+        <div style="background:#0d1117;border-radius:8px;padding:12px;border:1px solid var(--border);">
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;font-weight:600;">🚦 처리율 (events / 10s)</div>
+          <div style="position:relative;height:140px;"><canvas id="chart-throughput"></canvas></div>
+        </div>
+      </div>
+    </div>
+
     <div class="card" style="margin-top:12px;">
       <div class="card-title"><span class="icon">🕸️</span>운영 현황 허브 그래프 (NetworkX 토폴로지)
         <span id="mon-g-legend" style="margin-left:12px;font-size:11px;color:var(--text2);"></span>
@@ -1824,6 +1922,7 @@ function connectWS() {
     document.getElementById('mon-ts').textContent = kpiData.timestamp ? kpiData.timestamp.substring(11,19) : '-';
     document.getElementById('lastUpdate').textContent = '업데이트: ' + (kpiData.timestamp || '').substring(11,19);
     renderAll(kpiData);
+    _updateKpiTrendChart(kpiData);
   };
   ws.onclose = () => {
     document.getElementById('connDot').style.background = '#f85149';
@@ -1851,6 +1950,8 @@ function appendCdcEvent(msg) {
   if (!feed) return;
   const op    = msg.op || '?';
   const table = msg.table || msg.topic?.split('.').slice(-1)[0] || '?';
+  if (op !== '?')    _opCounts[op]      = (_opCounts[op]    || 0) + 1;
+  if (table !== '?') _tableCounts[table] = (_tableCounts[table] || 0) + 1;
   const ts    = new Date().toLocaleTimeString('ko-KR');
   const color = _OP_COLORS[op] || '#8b949e';
   const icon  = _TABLE_ICONS[table] || '📋';
@@ -1910,11 +2011,14 @@ async function loadInfraStatus() {
     if (redis.stream_len !== undefined) _redisStreamLen = redis.stream_len;
     const redisEl = document.getElementById('pl-redis-cnt');
     if (redisEl) redisEl.textContent = `${redis.stream_len||0} msgs`;
+    const cdcEl = document.getElementById('pl-cdc-cnt');
+    if (cdcEl) { cdcEl.textContent = `${redis.stream_len||0} events`; cdcEl.className = redis.stream_len > 0 ? 'pl-badge pl-ok' : 'pl-badge pl-warn'; }
+    _updateRedisChart(redis.stream_len || 0);
   } catch(e) {}
 
-  // 최근 이벤트 초기 로딩
+  // 최근 이벤트 초기 로딩 + 테이블/OP 집계
   try {
-    const r2 = await fetch('/api/infra/events?count=20');
+    const r2 = await fetch('/api/infra/events?count=50');
     const d2 = await r2.json();
     const feed = document.getElementById('cdc-live-feed');
     if (feed && d2.length) {
@@ -1922,6 +2026,8 @@ async function loadInfraStatus() {
       d2.forEach(ev => {
         const op = ev.op || '?';
         const table = ev.table || '?';
+        if (op !== '?') _opCounts[op] = (_opCounts[op] || 0) + 1;
+        if (table !== '?') _tableCounts[table] = (_tableCounts[table] || 0) + 1;
         const ts = ev.ts ? new Date(parseInt(ev.ts)*1000).toLocaleTimeString('ko-KR') : '-';
         const color = _OP_COLORS[op]||'#8b949e';
         const icon = _TABLE_ICONS[table]||'📋';
@@ -1932,6 +2038,132 @@ async function loadInfraStatus() {
       });
     }
   } catch(e) {}
+}
+
+// ──────────────────────────────────────────
+// 실시간 메트릭 차트 (Chart.js)
+// ──────────────────────────────────────────
+const _MON_MAX   = 30;
+let _monTimes    = [];
+let _opCounts    = {INSERT:0, UPDATE:0, DELETE:0};
+let _tableCounts = {};
+let _lastCdcSnap = 0;
+let _monCharts   = {};
+let _monInited   = false;
+
+function _pushRing(arr, val) { arr.push(val); if (arr.length > _MON_MAX) arr.shift(); }
+function _tLabel() { return new Date().toLocaleTimeString('ko-KR', {hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
+
+function initMonitorCharts() {
+  if (_monInited) return;
+  _monInited = true;
+  const base = {
+    responsive:true, maintainAspectRatio:false, animation:false,
+    plugins:{legend:{display:false}, tooltip:{mode:'index',intersect:false}},
+  };
+  const xTick = {ticks:{maxTicksLimit:6,color:'#484f58',font:{size:10}}, grid:{color:'#21262d'}};
+  const yTick = {ticks:{color:'#484f58',font:{size:10}}, grid:{color:'#21262d'}, beginAtZero:true};
+
+  // 1. CDC 누적 라인
+  const c1 = document.getElementById('chart-cdc-timeline');
+  if (c1) _monCharts.cdc = new Chart(c1, {
+    type:'line',
+    data:{labels:[],datasets:[{label:'CDC 누적',data:[],borderColor:'#58a6ff',backgroundColor:'rgba(88,166,255,0.12)',fill:true,tension:0.35,pointRadius:2}]},
+    options:{...base, scales:{x:xTick, y:{...yTick}}}
+  });
+
+  // 2. Redis Stream 라인
+  const c2 = document.getElementById('chart-redis-stream');
+  if (c2) _monCharts.redis = new Chart(c2, {
+    type:'line',
+    data:{labels:[],datasets:[{label:'Stream msgs',data:[],borderColor:'#3fb950',backgroundColor:'rgba(63,185,80,0.12)',fill:true,tension:0.35,pointRadius:2}]},
+    options:{...base, scales:{x:xTick, y:{...yTick}}}
+  });
+
+  // 3. 이벤트 유형 도넛
+  const c3 = document.getElementById('chart-event-donut');
+  if (c3) _monCharts.donut = new Chart(c3, {
+    type:'doughnut',
+    data:{labels:['INSERT','UPDATE','DELETE'],datasets:[{data:[0,0,0],backgroundColor:['#3fb950','#d29922','#f85149'],borderWidth:0}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      plugins:{legend:{position:'right',labels:{color:'#8b949e',boxWidth:10,font:{size:10}}}}}
+  });
+
+  // 4. 테이블별 수평 바
+  const c4 = document.getElementById('chart-table-bar');
+  if (c4) _monCharts.tbl = new Chart(c4, {
+    type:'bar',
+    data:{labels:[],datasets:[{label:'이벤트',data:[],backgroundColor:['#58a6ff','#3fb950','#d29922','#f85149','#a371f7','#79c0ff','#56d364','#ffa657'],borderWidth:0,borderRadius:3}]},
+    options:{...base, indexAxis:'y', scales:{x:{...yTick}, y:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'}}}}
+  });
+
+  // 5. KPI 트렌드 멀티라인
+  const c5 = document.getElementById('chart-kpi-trend');
+  if (c5) _monCharts.kpi = new Chart(c5, {
+    type:'line',
+    data:{labels:[],datasets:[
+      {label:'수주',    data:[],borderColor:'#58a6ff',tension:0.35,pointRadius:2,borderWidth:2},
+      {label:'일탈',    data:[],borderColor:'#f85149',tension:0.35,pointRadius:2,borderWidth:2},
+      {label:'Critical',data:[],borderColor:'#d29922',tension:0.35,pointRadius:2,borderWidth:2},
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      plugins:{legend:{display:true,position:'top',labels:{color:'#8b949e',boxWidth:10,font:{size:10}}}},
+      scales:{x:xTick, y:{...yTick}}}
+  });
+
+  // 6. 처리율 바
+  const c6 = document.getElementById('chart-throughput');
+  if (c6) _monCharts.tp = new Chart(c6, {
+    type:'bar',
+    data:{labels:[],datasets:[{label:'events/10s',data:[],backgroundColor:'rgba(163,113,247,0.6)',borderColor:'#a371f7',borderWidth:1,borderRadius:3}]},
+    options:{...base, scales:{x:xTick, y:{...yTick}}}
+  });
+}
+
+function _updateCdcMetricCharts() {
+  const t = _tLabel();
+  const total = _redisStreamLen || 0;
+  const delta = Math.max(0, total - _lastCdcSnap);
+  _lastCdcSnap = total;
+
+  if (_monCharts.cdc) {
+    _pushRing(_monCharts.cdc.data.labels, t);
+    _pushRing(_monCharts.cdc.data.datasets[0].data, total);
+    _monCharts.cdc.update('none');
+  }
+  if (_monCharts.tp) {
+    _pushRing(_monCharts.tp.data.labels, t);
+    _pushRing(_monCharts.tp.data.datasets[0].data, delta);
+    _monCharts.tp.update('none');
+  }
+  if (_monCharts.donut) {
+    _monCharts.donut.data.datasets[0].data = [_opCounts.INSERT||0, _opCounts.UPDATE||0, _opCounts.DELETE||0];
+    _monCharts.donut.update('none');
+  }
+  if (_monCharts.tbl) {
+    const entries = Object.entries(_tableCounts).sort((a,b)=>b[1]-a[1]).slice(0,8);
+    _monCharts.tbl.data.labels   = entries.map(([k]) => ((_TABLE_ICONS[k]||'📋')+' '+k.replace(/_/g,' ')));
+    _monCharts.tbl.data.datasets[0].data = entries.map(([,v])=>v);
+    _monCharts.tbl.update('none');
+  }
+}
+
+function _updateRedisChart(len) {
+  if (!_monCharts.redis) return;
+  _pushRing(_monCharts.redis.data.labels, _tLabel());
+  _pushRing(_monCharts.redis.data.datasets[0].data, len);
+  _monCharts.redis.update('none');
+}
+
+function _updateKpiTrendChart(d) {
+  if (!_monCharts.kpi) return;
+  const s   = d.sales || {};
+  const dev = d.quality_deviation || {};
+  _pushRing(_monCharts.kpi.data.labels, _tLabel());
+  _pushRing(_monCharts.kpi.data.datasets[0].data, s.total_orders    || 0);
+  _pushRing(_monCharts.kpi.data.datasets[1].data, dev.total_deviations || 0);
+  _pushRing(_monCharts.kpi.data.datasets[2].data, dev.critical      || 0);
+  _monCharts.kpi.update('none');
 }
 
 // ──────────────────────────────────────────
@@ -2483,7 +2715,7 @@ function showPanel(name, tab) {
   if (name === 'sales'       && !_kgLoaded.sales)       { loadTabGraph('sales',      'sales-g-canvas',  '_salesNet');  _kgLoaded.sales=true;       }
   if (name === 'quality'     && !_kgLoaded.quality)     { loadTabGraph('quality',    'quality-g-canvas','_qualNet');   _kgLoaded.quality=true;     }
   if (name === 'production'  && !_kgLoaded.production)  { loadTabGraph('production', 'prod-g-canvas',   '_prodNet');   _kgLoaded.production=true;  }
-  if (name === 'monitor'     && !_kgLoaded.monitor)     { loadTabGraph('monitor',    'mon-g-canvas',    '_monNet');  loadInfraStatus();  _kgLoaded.monitor=true;     }
+  if (name === 'monitor'     && !_kgLoaded.monitor)     { loadTabGraph('monitor',    'mon-g-canvas',    '_monNet');  loadInfraStatus();  initMonitorCharts();  _kgLoaded.monitor=true;     }
 }
 
 // ── OWL 온톨로지 ──
@@ -2938,8 +3170,8 @@ function grQuick(q) {
 // ──────────────────────────────────────────
 window.onload = () => {
   connectWS();
-  // 30초 간격으로 인프라 상태 갱신
   setInterval(loadInfraStatus, 30000);
+  setInterval(_updateCdcMetricCharts, 10000);
 };
 </script>
 </body>
@@ -2949,4 +3181,4 @@ window.onload = () => {
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8765, reload=False, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=8765, reload=False, log_level="info")

@@ -52,3 +52,8 @@ services:
   #     - "6380:6379"
   #   command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
   #   restart: unless-stopped
+
+  # ── 관측성 스택 ────────────────────────────────────────
+  # Prometheus(9090) / Grafana(3000) 는 kaist-l5-infra 프로젝트의
+  # 기존 컨테이너를 공용으로 사용합니다.
+  # CKD-NEXT 스크레이프 잡은 해당 prometheus.yml에 추가되었습니다.
