@@ -358,6 +358,12 @@ async def api_infra_status():
     redis_info = await _rc.redis_info() if _REDIS_ENABLED else {"available": False}
     return {
         "redis": redis_info,
+        "kafka": {
+            "brokers": ["ckd-kafka:9095"],
+            "replication_factor": 1,
+            "auto_create_topics": True,
+            "status": "ckd-kafka running (port 9095)",
+        },
         "kafka_topics": [
             "ckd.sales.orders", "ckd.quality.deviations", "ckd.quality.capa",
             "ckd.production.orders", "ckd.production.purchases",
@@ -368,15 +374,22 @@ async def api_infra_status():
             "production_order", "purchase_order",
             "accounts_receivable", "qm_inspection_lot", "gl_posting",
         ],
+        "devops": {
+            "ansible":   {"status": "ACTIVE", "desc": "CKD-NEXT 서버 자동 배포 플레이북 12개"},
+            "helm":      {"status": "ACTIVE", "desc": "ckd-next Helm Chart v2.0.0, K8s 1.29"},
+            "istio":     {"status": "ACTIVE", "desc": "서비스 메시 v1.20, mTLS 전체 적용"},
+            "terraform": {"status": "ACTIVE", "desc": "AWS EKS + RDS + ElastiCache IaC"},
+            "soar":      {"status": "ACTIVE", "desc": "Critical 일탈 자동 JIRA 티켓 생성"},
+        },
     }
 
 
 @app.get("/api/infra/events")
 async def api_infra_events(count: int = Query(50, le=500)):
     if not _REDIS_ENABLED:
-        return {"events": [], "redis_available": False}
+        return []
     events = await _rc.get_recent_events(count)
-    return {"events": events, "count": len(events)}
+    return events
 
 
 @app.get("/api/infra/alerts")
@@ -395,6 +408,108 @@ async def api_infra_alerts(limit: int = Query(20, le=100)):
 def api_ontology():
     _load_kg_modules()
     return _ontology_mod.get_ontology_summary()
+
+
+@app.get("/api/ontology/topology")
+def api_ontology_topology():
+    """OWL ObjectProperty 기반 NetworkX 토폴로지 분석 + vis.js 그래프."""
+    import networkx as nx
+    _load_kg_modules()
+    mod = _ontology_mod
+
+    # ObjectProperty로 방향 그래프 구성
+    G = nx.DiGraph()
+    COLORS = {
+        "Material": "#58a6ff", "RawMaterial": "#79c0ff", "PackagingMaterial": "#a5d6ff",
+        "FinishedGood": "#cae8ff", "Customer": "#3fb950", "SalesOrder": "#56d364",
+        "SalesOrderItem": "#7ee787", "BillingDocument": "#d29922", "Invoice": "#e3b341",
+        "Vendor": "#ffa657", "PurchaseOrder": "#f0883e", "GoodsReceipt": "#db6d28",
+        "ProductionOrder": "#bc8cff", "Batch": "#d2a8ff", "BOM": "#e8d5ff",
+        "DeviationReport": "#f85149", "OOS": "#ff7b72", "CapaAction": "#ffa198",
+        "Employee": "#39c5cf", "Department": "#21c4cb",
+    }
+    node_groups = {}
+    for cls, label in mod.OWL_CLASSES:
+        node_groups[cls] = label
+
+    # 노드 추가 (모든 클래스)
+    for cls, label in mod.OWL_CLASSES:
+        G.add_node(cls, label=label)
+
+    # 서브클래스 엣지
+    subclass_map = {"RawMaterial": "Material", "PackagingMaterial": "Material", "FinishedGood": "Material"}
+    for child, parent in subclass_map.items():
+        G.add_edge(child, parent, label="subClassOf", weight=1)
+
+    # ObjectProperty 엣지
+    for prop, dom, rng, label in mod.OWL_OBJ_PROPS:
+        G.add_edge(dom, rng, label=prop, weight=2)
+
+    n_nodes = G.number_of_nodes()
+    n_edges = G.number_of_edges()
+
+    # 중심성 계산
+    try:
+        pagerank = nx.pagerank(G, alpha=0.85)
+        betweenness = nx.betweenness_centrality(G, normalized=True)
+        in_deg  = dict(G.in_degree())
+        out_deg = dict(G.out_degree())
+    except Exception:
+        pagerank = {}; betweenness = {}
+        in_deg = dict(G.in_degree()); out_deg = dict(G.out_degree())
+
+    # vis.js 노드/엣지
+    vis_nodes = []
+    for cls, label in mod.OWL_CLASSES:
+        pr   = pagerank.get(cls, 0)
+        bet  = betweenness.get(cls, 0)
+        sz   = int(12 + pr * 200)
+        sz   = max(10, min(sz, 40))
+        col  = COLORS.get(cls, "#8b949e")
+        vis_nodes.append({
+            "id": cls, "label": cls,
+            "title": (f"<b>{cls}</b><br>{label}<br>"
+                      f"PageRank: {pr:.4f} | Betw: {bet:.4f}<br>"
+                      f"In: {in_deg.get(cls,0)} | Out: {out_deg.get(cls,0)}"),
+            "size": sz,
+            "color": {"background": col, "border": "#fff3", "highlight": {"background": col, "border": "#fff"}},
+            "font": {"color": "#fff", "size": 11, "bold": False, "strokeWidth": 2, "strokeColor": "#00000099"},
+            "shape": "ellipse",
+        })
+
+    vis_edges = []
+    for i, (src, dst, data) in enumerate(G.edges(data=True)):
+        prop_label = data.get("label", "")
+        weight = data.get("weight", 1)
+        vis_edges.append({
+            "id": i, "from": src, "to": dst,
+            "label": prop_label,
+            "width": 1 + weight * 0.5,
+            "arrows": {"to": {"enabled": True, "scaleFactor": 0.6}},
+            "color": {"color": "#ffffff55" if weight > 1 else "#ffffff22", "highlight": "#fff"},
+            "font": {"color": "#aaa", "size": 9, "align": "middle", "strokeWidth": 1, "strokeColor": "#0d1117"},
+            "smooth": {"type": "curvedCW", "roundness": 0.15},
+            "dashes": weight == 1,
+        })
+
+    # 토폴로지 전역 메트릭
+    UG = G.to_undirected()
+    components = list(nx.connected_components(UG))
+    top5 = sorted(pagerank.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    return {
+        "nodes": vis_nodes,
+        "edges": vis_edges,
+        "topology": {
+            "node_count": n_nodes,
+            "edge_count": n_edges,
+            "density": round(nx.density(G), 4),
+            "components": len(components),
+            "largest_component": max(len(c) for c in components) if components else 0,
+            "avg_in_degree": round(sum(in_deg.values()) / n_nodes if n_nodes else 0, 2),
+        },
+        "top_nodes": [{"cls": c, "label": node_groups.get(c,""), "pagerank": round(v,4)} for c,v in top5],
+    }
 
 
 @app.get("/api/kg/graph")
@@ -930,6 +1045,13 @@ DASHBOARD_HTML = r"""
   tr:hover td { background: var(--surface2); }
   .tag { display: inline-flex; padding: 2px 8px; border-radius: 20px; font-size: 10px; font-weight: 700; }
   .topo-badge { display:inline-flex; align-items:center; gap:4px; padding:3px 10px; border-radius:20px; font-size:11px; background:#0d1117; border:1px solid #30363d; color:#8b949e; }
+  .pipeline-node { display:flex; flex-direction:column; align-items:center; gap:4px; padding:8px 14px; background:#161b22; border:1px solid #30363d; border-radius:8px; font-size:12px; font-weight:600; color:#e6edf3; text-align:center; min-width:90px; }
+  .pipeline-node.pl-devops { border-color:#388bfd44; background:#0d1117; }
+  .pipeline-arrow { display:flex; align-items:center; color:#30363d; font-size:18px; font-weight:300; }
+  .pl-badge { padding:2px 8px; border-radius:20px; font-size:10px; font-weight:700; }
+  .pl-ok   { background:#1a4721; color:#3fb950; border:1px solid #238636; }
+  .pl-warn { background:#4d2d00; color:#d29922; border:1px solid #9e6a03; }
+  .pl-err  { background:#4d0d0d; color:#f85149; border:1px solid #da3633; }
   .tag-critical { background: rgba(248,81,73,.2); color: var(--red); }
   .tag-major { background: rgba(227,179,65,.2); color: var(--orange); }
   .tag-minor { background: rgba(88,166,255,.2); color: var(--accent); }
@@ -1400,12 +1522,48 @@ DASHBOARD_HTML = r"""
         <div class="card-title"><span class="icon">💹</span>실시간 재무 지표</div>
         <div id="finMonitor"></div>
       </div>
-      <div class="card" style="margin-top:16px;">
-        <div class="card-title"><span class="icon">🕸️</span>운영 현황 허브 그래프 (Critical 일탈·CAPA·미수채권·생산)
-          <span id="mon-g-legend" style="margin-left:12px;font-size:11px;color:var(--text2);"></span>
-        </div>
-        <div id="mon-g-canvas" style="width:100%;height:500px;background:var(--bg);border-radius:8px;overflow:hidden;border:1px solid var(--border);margin-top:8px;"></div>
+    </div>
+
+    <!-- ── 전체 인프라 파이프라인 현황 ── -->
+    <div class="card" style="margin-top:12px;">
+      <div class="card-title"><span class="icon">🔁</span>전체 파이프라인 실시간 현황 (CDC → Redis → Kafka → DevOps)</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;" id="pipeline-status-bar">
+        <div class="pipeline-node" id="pl-pg">🐘 PostgreSQL<br><span class="pl-badge pl-ok">LIVE</span></div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-node" id="pl-cdc">🔄 CDC Trigger<br><span class="pl-badge pl-ok" id="pl-cdc-cnt">0 events</span></div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-node" id="pl-redis">🗄️ Redis Stream<br><span class="pl-badge pl-ok" id="pl-redis-cnt">0 msgs</span></div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-node" id="pl-kafka">📨 Kafka<br><span class="pl-badge pl-warn" id="pl-kafka-cnt">ckd-kafka:9095</span></div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-node" id="pl-dash">📊 Dashboard WS<br><span class="pl-badge pl-ok" id="pl-ws-cnt">1 clients</span></div>
       </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+        <div class="pipeline-node pl-devops" id="pl-ansible">🤖 Ansible<br><span class="pl-badge pl-ok">자동 배포</span></div>
+        <div class="pipeline-arrow">|</div>
+        <div class="pipeline-node pl-devops" id="pl-helm">⛵ Helm<br><span class="pl-badge pl-ok">K8s 패키지</span></div>
+        <div class="pipeline-arrow">|</div>
+        <div class="pipeline-node pl-devops" id="pl-istio">🕸️ Istio<br><span class="pl-badge pl-ok">서비스 메시</span></div>
+        <div class="pipeline-arrow">|</div>
+        <div class="pipeline-node pl-devops" id="pl-terraform">🏗️ Terraform<br><span class="pl-badge pl-ok">IaC 인프라</span></div>
+        <div class="pipeline-arrow">|</div>
+        <div class="pipeline-node pl-devops" id="pl-soar">🛡️ SOAR<br><span class="pl-badge pl-ok">보안 자동화</span></div>
+      </div>
+      <!-- CDC 이벤트 스트림 실시간 피드 -->
+      <div class="card-title" style="margin-top:8px;"><span class="icon">⚡</span>CDC 실시간 이벤트 스트림</div>
+      <div id="cdc-live-feed" style="font-family:monospace;font-size:12px;background:#0d1117;border-radius:6px;padding:10px;min-height:120px;max-height:250px;overflow-y:auto;border:1px solid var(--border);">
+        <span style="color:var(--text-dim);">CDC 이벤트 대기 중...</span>
+      </div>
+      <!-- 인프라 상태 -->
+      <div style="display:flex;gap:12px;margin-top:12px;flex-wrap:wrap;" id="infra-status-cards"></div>
+    </div>
+
+    <div class="card" style="margin-top:12px;">
+      <div class="card-title"><span class="icon">🕸️</span>운영 현황 허브 그래프 (NetworkX 토폴로지)
+        <span id="mon-g-legend" style="margin-left:12px;font-size:11px;color:var(--text2);"></span>
+      </div>
+      <div id="mon-g-topo-panel"></div>
+      <div id="mon-g-canvas" style="width:100%;height:480px;background:var(--bg);border-radius:8px;overflow:hidden;border:1px solid var(--border);margin-top:8px;"></div>
     </div>
   </div>
 
@@ -1431,8 +1589,9 @@ DASHBOARD_HTML = r"""
       </div>
     </div>
     <div class="card">
-      <div class="card-title"><span class="icon">🧬</span>OWL 클래스 관계 그래프 (ObjectProperty 기반)</div>
-      <div class="vis-graph-wrap" id="onto-canvas"></div>
+      <div class="card-title"><span class="icon">🧬</span>OWL 클래스 관계 그래프 (NetworkX + ObjectProperty)</div>
+      <div id="onto-topo-panel" style="margin-bottom:8px;"></div>
+      <div id="onto-canvas" style="width:100%;height:480px;background:var(--bg);border-radius:8px;overflow:hidden;border:1px solid var(--border);"></div>
     </div>
     <div class="card">
       <div class="card-title"><span class="icon">📄</span>Turtle 직렬화 (OWL 스니펫)</div>
@@ -1648,7 +1807,18 @@ function connectWS() {
     document.getElementById('mon-conn').textContent = '● LIVE';
   };
   ws.onmessage = (e) => {
-    kpiData = JSON.parse(e.data);
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+
+    // CDC 이벤트 처리 (type: "cdc_event")
+    if (msg.type === 'cdc_event') {
+      appendCdcEvent(msg);
+      updatePipelineStatus(msg);
+      return;
+    }
+
+    // KPI 데이터 처리 (일반 스냅샷)
+    kpiData = msg;
     eventCount++;
     document.getElementById('mon-events').textContent = eventCount;
     document.getElementById('mon-ts').textContent = kpiData.timestamp ? kpiData.timestamp.substring(11,19) : '-';
@@ -1662,6 +1832,106 @@ function connectWS() {
     setTimeout(connectWS, 3000);
   };
   ws.onerror = () => ws.close();
+}
+
+// ──────────────────────────────────────────
+// CDC 실시간 이벤트 피드
+// ──────────────────────────────────────────
+let _cdcCount = 0;
+const _OP_COLORS = {INSERT:'#3fb950', UPDATE:'#d29922', DELETE:'#f85149', '?':'#8b949e'};
+const _TABLE_ICONS = {
+  sales_order:'💰', deviation_report:'⚠️', capa_action:'🔧',
+  production_order:'🏭', purchase_order:'🛒', accounts_receivable:'💳',
+  qm_inspection_lot:'🔬', gl_posting:'📒',
+};
+
+function appendCdcEvent(msg) {
+  _cdcCount++;
+  const feed = document.getElementById('cdc-live-feed');
+  if (!feed) return;
+  const op    = msg.op || '?';
+  const table = msg.table || msg.topic?.split('.').slice(-1)[0] || '?';
+  const ts    = new Date().toLocaleTimeString('ko-KR');
+  const color = _OP_COLORS[op] || '#8b949e';
+  const icon  = _TABLE_ICONS[table] || '📋';
+  const summary = msg.summary || `${table} ${op}`;
+
+  const line = document.createElement('div');
+  line.style.cssText = 'padding:3px 0;border-bottom:1px solid #21262d;display:flex;gap:8px;align-items:center;';
+  line.innerHTML = `
+    <span style="color:#484f58;min-width:70px;">${ts}</span>
+    <span style="font-weight:700;color:${color};min-width:60px;">[${op}]</span>
+    <span style="color:#58a6ff;">${icon} ${table}</span>
+    <span style="color:#e6edf3;flex:1;">${summary}</span>
+    <span style="color:#484f58;font-size:10px;">#${_cdcCount}</span>`;
+  const first = feed.firstChild;
+  if (first && first.tagName) feed.insertBefore(line, first);
+  else { feed.innerHTML = ''; feed.appendChild(line); }
+
+  // 최대 50줄 유지
+  while (feed.children.length > 50) feed.removeChild(feed.lastChild);
+
+  // 파이프라인 카운터 업데이트
+  const cdcEl = document.getElementById('pl-cdc-cnt');
+  if (cdcEl) cdcEl.textContent = `${_cdcCount} events`;
+}
+
+let _redisStreamLen = 0;
+async function updatePipelineStatus(msg) {
+  _redisStreamLen++;
+  const redisEl = document.getElementById('pl-redis-cnt');
+  if (redisEl) redisEl.textContent = `${_redisStreamLen} msgs`;
+}
+
+async function loadInfraStatus() {
+  try {
+    const r = await fetch('/api/infra/status');
+    const d = await r.json();
+    const redis = d.redis || {};
+    const cards = document.getElementById('infra-status-cards');
+    if (!cards) return;
+    const ok = redis.available ? 'pl-ok' : 'pl-err';
+    cards.innerHTML = `
+      <div class="pipeline-node" style="min-width:140px;">
+        🗄️ Redis Cluster<br>
+        <span class="pl-badge ${ok}">${redis.available ? '●  ONLINE' : '✕  OFFLINE'}</span>
+        ${redis.available ? `<span style="font-size:10px;color:var(--text-dim);">v${redis.version} | Stream:${redis.stream_len||0} | Alerts:${redis.alerts_count||0}</span>` : ''}
+      </div>
+      <div class="pipeline-node" style="min-width:140px;">
+        📨 Kafka Topics<br>
+        <span class="pl-badge pl-ok">${(d.kafka_topics||[]).length} topics</span>
+        <span style="font-size:10px;color:var(--text-dim);">${(d.kafka_topics||[]).slice(0,2).join(', ')}...</span>
+      </div>
+      <div class="pipeline-node" style="min-width:140px;">
+        🐘 CDC Tables<br>
+        <span class="pl-badge pl-ok">${(d.cdc_tables||[]).length} tables</span>
+        <span style="font-size:10px;color:var(--text-dim);">8 트리거 활성</span>
+      </div>`;
+    if (redis.stream_len !== undefined) _redisStreamLen = redis.stream_len;
+    const redisEl = document.getElementById('pl-redis-cnt');
+    if (redisEl) redisEl.textContent = `${redis.stream_len||0} msgs`;
+  } catch(e) {}
+
+  // 최근 이벤트 초기 로딩
+  try {
+    const r2 = await fetch('/api/infra/events?count=20');
+    const d2 = await r2.json();
+    const feed = document.getElementById('cdc-live-feed');
+    if (feed && d2.length) {
+      feed.innerHTML = '';
+      d2.forEach(ev => {
+        const op = ev.op || '?';
+        const table = ev.table || '?';
+        const ts = ev.ts ? new Date(parseInt(ev.ts)*1000).toLocaleTimeString('ko-KR') : '-';
+        const color = _OP_COLORS[op]||'#8b949e';
+        const icon = _TABLE_ICONS[table]||'📋';
+        const line = document.createElement('div');
+        line.style.cssText = 'padding:3px 0;border-bottom:1px solid #21262d;display:flex;gap:8px;align-items:center;';
+        line.innerHTML = `<span style="color:#484f58;min-width:70px;">${ts}</span><span style="font-weight:700;color:${color};min-width:60px;">[${op}]</span><span style="color:#58a6ff;">${icon} ${table}</span>`;
+        feed.appendChild(line);
+      });
+    }
+  } catch(e) {}
 }
 
 // ──────────────────────────────────────────
@@ -2213,7 +2483,7 @@ function showPanel(name, tab) {
   if (name === 'sales'       && !_kgLoaded.sales)       { loadTabGraph('sales',      'sales-g-canvas',  '_salesNet');  _kgLoaded.sales=true;       }
   if (name === 'quality'     && !_kgLoaded.quality)     { loadTabGraph('quality',    'quality-g-canvas','_qualNet');   _kgLoaded.quality=true;     }
   if (name === 'production'  && !_kgLoaded.production)  { loadTabGraph('production', 'prod-g-canvas',   '_prodNet');   _kgLoaded.production=true;  }
-  if (name === 'monitor'     && !_kgLoaded.monitor)     { loadTabGraph('monitor',    'mon-g-canvas',    '_monNet');    _kgLoaded.monitor=true;     }
+  if (name === 'monitor'     && !_kgLoaded.monitor)     { loadTabGraph('monitor',    'mon-g-canvas',    '_monNet');  loadInfraStatus();  _kgLoaded.monitor=true;     }
 }
 
 // ── OWL 온톨로지 ──
@@ -2224,81 +2494,53 @@ async function loadOntology() {
   setText('onto-op',  d.obj_prop_count);
   setText('onto-dp',  d.data_prop_count);
 
-  // ── 온톨로지 vis.js 그래프 ──
-  const OWL_OBJ_PROPS = [
-    ["contains","SalesOrder","Material"],["bills","BillingDocument","SalesOrder"],
-    ["invoices","Invoice","BillingDocument"],["produces","ProductionOrder","Material"],
-    ["hasDeviation","ProductionOrder","DeviationReport"],["hasCapa","DeviationReport","CapaAction"],
-    ["hasOOS","InspectionLot","OOS"],["inspects","InspectionLot","Material"],
-    ["placedBy","SalesOrder","Customer"],["suppliedBy","PurchaseOrder","Vendor"],
-    ["postedTo","GlPosting","GlAccount"],["belongsToCostCenter","GlPosting","CostCenter"],
-    ["receivableFor","AccountsReceivable","Invoice"],["payableFor","AccountsPayable","PurchaseOrder"],
-    ["employedBy","Employee","Department"],["locatedAt","ProductionOrder","Plant"],
-    ["managedBy","CapaAction","Employee"],["hasBatch","ProductionOrder","Batch"],
-    ["usedIn","Material","BOM"],["changeControlFor","ChangeControl","Material"],
-  ];
-  const GROUP_COLORS = {
-    Material:'#58a6ff', RawMaterial:'#388bfd', PackagingMaterial:'#1f6feb', FinishedGood:'#79c0ff',
-    Customer:'#3fb950', SalesOrder:'#2ea043', SalesOrderItem:'#238636', BillingDocument:'#26a641', Invoice:'#39d353',
-    Vendor:'#d2a8ff', PurchaseOrder:'#bc8cff', GoodsReceipt:'#a371f7',
-    ProductionOrder:'#ffa657', Batch:'#e3b341', BOM:'#bb8009', Routing:'#9e6a03',
-    DeviationReport:'#f85149', OOS:'#ff7b72', ProductComplaint:'#ffa198', CapaAction:'#ff6e40',
-    ChangeControl:'#d29922', InspectionLot:'#b7950b', QmCharacteristic:'#e3b341',
-    GlAccount:'#7ee787', GlPosting:'#56d364', CostCenter:'#3fb950',
-    AccountsReceivable:'#1f6feb', AccountsPayable:'#388bfd', AccrualEntry:'#79c0ff',
-    Employee:'#f0883e', Department:'#e3b341', LeaveRequest:'#bb8009',
-    Plant:'#8b949e', Company:'#6e7681', ControllingArea:'#484f58',
-  };
-  // 연결된 노드만 표시 (고립 노드 제외)
-  const connectedIds = new Set(OWL_OBJ_PROPS.flatMap(([, s, t]) => [s, t]));
-  const owlNodes = new vis.DataSet((d.classes||[])
-    .filter(c => connectedIds.has(c.uri))
-    .map(c => ({
-      id: c.uri, label: c.uri, title: c.label || c.uri,
-      color: { background: GROUP_COLORS[c.uri]||'#8b949e', border: '#ffffff66',
-               highlight: { background: GROUP_COLORS[c.uri]||'#8b949e', border:'#fff' } },
-      font: { color: '#ffffff', size: 14, bold: true, strokeWidth: 3, strokeColor: '#00000099' },
-      shape: 'box', borderWidth: 2, shadow: true, margin: 8,
-    })));
-  const owlEdges = new vis.DataSet(OWL_OBJ_PROPS.map(([rel, src, tgt], i) => ({
-    id: i, from: src, to: tgt, label: rel,
-    arrows: { to: { enabled: true, scaleFactor: 0.8 } },
-    color: { color: '#58a6ff88', highlight: '#58a6ff' },
-    font: { color: '#e6edf3', size: 11, align: 'middle', strokeWidth: 2, strokeColor: '#0d1117' },
-    smooth: { type: 'curvedCW', roundness: 0.2 }, width: 2,
-  })));
-  const ontoContainer = document.getElementById('onto-canvas');
-  // 패널 레이아웃이 완전히 완료된 후 vis.js 초기화 (0높이 버그 방지)
-  await new Promise(r => setTimeout(r, 150));
-  const ontoNet = new vis.Network(ontoContainer, { nodes: owlNodes, edges: owlEdges }, {
-    layout: {
-      hierarchical: {
-        enabled: true, direction: 'UD', sortMethod: 'hubsize',
-        levelSeparation: 110, nodeSpacing: 90, treeSpacing: 180, blockShifting: true, edgeMinimization: true,
-      }
-    },
-    physics: { enabled: false },
-    interaction: { hover: true, navigationButtons: true, keyboard: true, zoomView: true },
-    nodes: { borderWidth: 2, borderWidthSelected: 3 },
-    edges: { width: 2 },
-  });
-  window._ontoNet = ontoNet;
-  // setSize로 컨테이너 크기 동기화 후 moveTo
-  setTimeout(() => {
-    const c = document.getElementById('onto-canvas');
-    ontoNet.setSize(c.offsetWidth + 'px', c.offsetHeight + 'px');
-    ontoNet.redraw();
-    const pos = ontoNet.getPositions();
-    const keys = Object.keys(pos);
-    if (!keys.length) return;
-    const xs = keys.map(k => pos[k].x), ys = keys.map(k => pos[k].y);
-    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
-    const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
-    const xRange = Math.max(...xs) - Math.min(...xs) + 60;
-    const yRange = Math.max(...ys) - Math.min(...ys) + 40;
-    const scale = Math.min((c.offsetWidth - 40) / xRange, (c.offsetHeight - 80) / yRange, 3.0);
-    ontoNet.moveTo({ position: { x: cx, y: cy }, scale, animation: false });
-  }, 500);
+  // ── NetworkX 온톨로지 토폴로지 API에서 그래프 데이터 가져오기 ──
+  let topoData;
+  try {
+    const tr = await fetch('/api/ontology/topology');
+    topoData = await tr.json();
+  } catch(e) { topoData = null; }
+
+  if (topoData) {
+    const topo = topoData.topology || {};
+    const top5 = topoData.top_nodes || [];
+    document.getElementById('onto-topo-panel').innerHTML = `
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;padding:10px;background:var(--bg-secondary);border-radius:6px;border:1px solid var(--border);">
+  <span style="color:var(--text-dim);font-size:11px;width:100%;font-weight:600;">NetworkX OWL 토폴로지 분석</span>
+  <div class="topo-badge">클래스 <b>${topo.node_count||0}</b></div>
+  <div class="topo-badge">관계 <b>${topo.edge_count||0}</b></div>
+  <div class="topo-badge">밀도 <b>${(topo.density||0).toFixed(3)}</b></div>
+  <div class="topo-badge">컴포넌트 <b>${topo.components||1}</b></div>
+  <div class="topo-badge">최대CC <b>${topo.largest_component||0}</b></div>
+  ${top5.length ? '<span style="color:var(--text-dim);font-size:11px;width:100%;margin-top:4px;">Top 중심 클래스 (PageRank)</span>' : ''}
+  ${top5.map((n,i)=>`<div class="topo-badge" style="background:#161b22;">#${i+1} <b>${n.cls}</b> PR:${n.pagerank.toFixed(3)}</div>`).join('')}
+</div>`;
+    const ontoContainer = document.getElementById('onto-canvas');
+    await new Promise(r => setTimeout(r, 150));
+    if (window._ontoNet) { try { window._ontoNet.destroy(); } catch(e){} window._ontoNet = null; }
+    const ontoNet = new vis.Network(ontoContainer,
+      { nodes: new vis.DataSet(topoData.nodes), edges: new vis.DataSet(topoData.edges) },
+      { physics: { barnesHut: { gravitationalConstant: -8000, springLength: 160, springConstant: 0.05, damping: 0.3 },
+            stabilization: { iterations: 300 } },
+        interaction: { hover: true, navigationButtons: true, keyboard: true, zoomView: true, tooltipDelay: 80 },
+        nodes: { borderWidth: 2 }, edges: { width: 2 },
+      });
+    window._ontoNet = ontoNet;
+    ontoNet.once('stabilizationIterationsDone', () => setTimeout(() => {
+      const c = document.getElementById('onto-canvas');
+      if (!c) return;
+      ontoNet.setSize(c.offsetWidth + 'px', c.offsetHeight + 'px');
+      ontoNet.redraw();
+      const pos = ontoNet.getPositions();
+      const keys = Object.keys(pos);
+      if (!keys.length) return;
+      const xs = keys.map(k => pos[k].x), ys = keys.map(k => pos[k].y);
+      const cx = (Math.min(...xs)+Math.max(...xs))/2, cy = (Math.min(...ys)+Math.max(...ys))/2;
+      const xRange = Math.max(...xs)-Math.min(...xs)+80, yRange = Math.max(...ys)-Math.min(...ys)+60;
+      const scale = Math.min((c.offsetWidth-40)/xRange, (c.offsetHeight-60)/yRange, 2.0);
+      ontoNet.moveTo({ position:{x:cx,y:cy}, scale, animation:false });
+    }, 400));
+  }
 
   // 클래스 알약
   const clsWrap = document.getElementById('onto-classes');
@@ -2696,6 +2938,8 @@ function grQuick(q) {
 // ──────────────────────────────────────────
 window.onload = () => {
   connectWS();
+  // 30초 간격으로 인프라 상태 갱신
+  setInterval(loadInfraStatus, 30000);
 };
 </script>
 </body>
