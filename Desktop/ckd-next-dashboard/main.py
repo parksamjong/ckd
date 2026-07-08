@@ -2,10 +2,12 @@
 CKD-NEXT 종합 운영 대시보드
 FastAPI + WebSocket 실시간 모니터링
 + RDF/OWL 온톨로지 + NetworkX 지식 그래프 + Neo4j Cypher + Vector RAG + GraphRAG
++ Kafka CDC + Redis 캐시/PubSub
 """
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -14,6 +16,13 @@ import psycopg2.extras
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+# Redis 캐시 레이어 (Redis 없으면 graceful fallback)
+try:
+    import redis_cache as _rc
+    _REDIS_ENABLED = True
+except ImportError:
+    _REDIS_ENABLED = False
 
 # KG 모듈 (지연 임포트 — 서버 시작 속도 유지)
 _kg_modules_loaded = False
@@ -39,7 +48,20 @@ def _load_kg_modules():
         _graphrag_mod = _g
         _kg_modules_loaded = True
 
-app = FastAPI(title="CKD-NEXT 대시보드", version="1.0.0")
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    # ── 시작 ──────────────────────────────────────────────────
+    if _REDIS_ENABLED:
+        await _rc.init_redis()
+        # Redis Pub/Sub → WebSocket 브로드캐스트 백그라운드 태스크
+        asyncio.ensure_future(_redis_pubsub_broadcaster())
+    yield
+    # ── 종료 ──────────────────────────────────────────────────
+    if _REDIS_ENABLED:
+        await _rc.close_redis()
+
+
+app = FastAPI(title="CKD-NEXT 대시보드", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -268,26 +290,101 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+async def _redis_pubsub_broadcaster():
+    """Redis Pub/Sub에서 CDC 이벤트를 수신해 WebSocket으로 브로드캐스트."""
+    async def _on_msg(data: str):
+        try:
+            payload = json.loads(data)
+            await manager.broadcast({
+                "type":    "cdc_event",
+                "topic":   payload.get("topic", ""),
+                "op":      payload.get("op", ""),
+                "summary": payload.get("summary", ""),
+                "ts":      payload.get("ts", 0),
+            })
+        except Exception:
+            pass
+    try:
+        await _rc.subscribe_realtime(_on_msg)
+    except Exception as e:
+        import logging
+        logging.getLogger("ckd.main").warning(f"Redis PubSub 브릿지 종료: {e}")
+
+
 @app.websocket("/ws/monitor")
 async def websocket_monitor(ws: WebSocket):
     await manager.connect(ws)
     try:
         while True:
-            kpis = fetch_kpis()
+            # Redis 캐시 우선 조회, 없으면 DB 조회 후 캐시 저장
+            if _REDIS_ENABLED:
+                cached = await _rc.get_kpi_cache()
+                if cached:
+                    kpis = cached
+                else:
+                    kpis = fetch_kpis()
+                    await _rc.set_kpi_cache(kpis)
+            else:
+                kpis = fetch_kpis()
             await ws.send_text(json.dumps(kpis, default=str, ensure_ascii=False))
-            await asyncio.sleep(5)  # 5초마다 실시간 갱신
+            await asyncio.sleep(5)
     except WebSocketDisconnect:
         manager.disconnect(ws)
 
 
 @app.get("/api/kpis")
-def api_kpis():
-    return fetch_kpis()
+async def api_kpis():
+    if _REDIS_ENABLED:
+        cached = await _rc.get_kpi_cache()
+        if cached:
+            return cached
+    data = fetch_kpis()
+    if _REDIS_ENABLED:
+        await _rc.set_kpi_cache(data)
+    return data
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
+
+
+# ══════════════════════════════════════════════════════════════
+# Redis / Kafka 상태 API
+# ══════════════════════════════════════════════════════════════
+
+@app.get("/api/infra/status")
+async def api_infra_status():
+    redis_info = await _rc.redis_info() if _REDIS_ENABLED else {"available": False}
+    return {
+        "redis": redis_info,
+        "kafka_topics": [
+            "ckd.sales.orders", "ckd.quality.deviations", "ckd.quality.capa",
+            "ckd.production.orders", "ckd.production.purchases",
+            "ckd.finance.ar", "ckd.quality.lots", "ckd.finance.gl",
+        ],
+        "cdc_tables": [
+            "sales_order", "deviation_report", "capa_action",
+            "production_order", "purchase_order",
+            "accounts_receivable", "qm_inspection_lot", "gl_posting",
+        ],
+    }
+
+
+@app.get("/api/infra/events")
+async def api_infra_events(count: int = Query(50, le=500)):
+    if not _REDIS_ENABLED:
+        return {"events": [], "redis_available": False}
+    events = await _rc.get_recent_events(count)
+    return {"events": events, "count": len(events)}
+
+
+@app.get("/api/infra/alerts")
+async def api_infra_alerts(limit: int = Query(20, le=100)):
+    if not _REDIS_ENABLED:
+        return {"alerts": [], "redis_available": False}
+    alerts = await _rc.get_critical_alerts(limit)
+    return {"alerts": alerts, "count": len(alerts)}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -619,6 +716,131 @@ def api_tab_graph(tab: str = Query("sales")):
     return {"nodes": nodes, "edges": edges}
 
 
+# ────────────────────────────────────────────────────────────────
+# NetworkX 전체 토폴로지 분석 엔드포인트
+# ────────────────────────────────────────────────────────────────
+@app.get("/api/topology")
+def api_topology(tab: str = Query("sales")):
+    """NetworkX 기반 그래프 토폴로지 메트릭 계산."""
+    import networkx as nx
+
+    # /api/graph와 동일한 방식으로 그래프 데이터 구성
+    graph_data = api_tab_graph(tab)
+    nodes_raw = graph_data["nodes"]
+    edges_raw = graph_data["edges"]
+
+    if not nodes_raw:
+        return {"metrics": {}, "nodes": [], "topology": {}}
+
+    # NetworkX DiGraph 구성
+    G = nx.DiGraph()
+    for n in nodes_raw:
+        G.add_node(n["id"], label=n.get("label",""), group=n.get("group",""))
+    for e in edges_raw:
+        G.add_edge(e["from"], e["to"], label=e.get("label",""))
+
+    UG = G.to_undirected()
+
+    # ── 중심성 지표 계산 ──
+    try:
+        degree_c    = nx.degree_centrality(G)
+        between_c   = nx.betweenness_centrality(G, normalized=True)
+        in_degree   = dict(G.in_degree())
+        out_degree  = dict(G.out_degree())
+    except Exception:
+        degree_c    = {}
+        between_c   = {}
+        in_degree   = dict(G.in_degree())
+        out_degree  = dict(G.out_degree())
+
+    try:
+        closeness_c = nx.closeness_centrality(UG)
+    except Exception:
+        closeness_c = {}
+
+    try:
+        pagerank = nx.pagerank(G, alpha=0.85, max_iter=100)
+    except Exception:
+        pagerank = {}
+
+    # ── 토폴로지 전역 지표 ──
+    n_nodes = G.number_of_nodes()
+    n_edges = G.number_of_edges()
+
+    try:
+        density = nx.density(G)
+    except Exception:
+        density = 0.0
+
+    components = list(nx.weakly_connected_components(G))
+    n_components = len(components)
+    largest_component = max(len(c) for c in components) if components else 0
+
+    try:
+        avg_degree = sum(dict(UG.degree()).values()) / n_nodes if n_nodes else 0
+    except Exception:
+        avg_degree = 0.0
+
+    # ── 노드별 메트릭 병합 ──
+    enriched_nodes = []
+    for n in nodes_raw:
+        nid = n["id"]
+        deg_c = round(degree_c.get(nid, 0), 4)
+        bet_c = round(between_c.get(nid, 0), 4)
+        clo_c = round(closeness_c.get(nid, 0), 4)
+        pr    = round(pagerank.get(nid, 0), 4)
+        ind   = in_degree.get(nid, 0)
+        outd  = out_degree.get(nid, 0)
+
+        # 중요도에 따라 크기 조절 (size 8~30)
+        importance = pr if pr else deg_c
+        node_size  = int(10 + importance * 120)
+        node_size  = max(8, min(node_size, 30))
+
+        enriched = dict(n)
+        enriched["size"] = node_size
+        enriched["title"] = (
+            f"<b>{n.get('label','')}</b> [{n.get('group','')}]<br>"
+            f"PageRank: {pr:.4f} | Degree: {deg_c:.4f}<br>"
+            f"Betweenness: {bet_c:.4f} | Closeness: {clo_c:.4f}<br>"
+            f"In-degree: {ind} | Out-degree: {outd}"
+        )
+        enriched["_metrics"] = {
+            "degree_centrality": deg_c,
+            "betweenness_centrality": bet_c,
+            "closeness_centrality": clo_c,
+            "pagerank": pr,
+            "in_degree": ind,
+            "out_degree": outd,
+        }
+        enriched_nodes.append(enriched)
+
+    # ── Top-5 중심 노드 ──
+    sorted_by_pr = sorted(enriched_nodes, key=lambda x: x["_metrics"]["pagerank"], reverse=True)
+    top5_nodes   = [{"id": x["id"], "label": x.get("label",""), "group": x.get("group",""),
+                     "pagerank": x["_metrics"]["pagerank"],
+                     "betweenness": x["_metrics"]["betweenness_centrality"]}
+                    for x in sorted_by_pr[:5]]
+
+    # 직렬화 전 _metrics 제거
+    for n in enriched_nodes:
+        n.pop("_metrics", None)
+
+    return {
+        "nodes": enriched_nodes,
+        "edges": edges_raw,
+        "topology": {
+            "node_count": n_nodes,
+            "edge_count": n_edges,
+            "density": round(density, 4),
+            "components": n_components,
+            "largest_component": largest_component,
+            "avg_degree": round(avg_degree, 2),
+        },
+        "top_nodes": top5_nodes,
+    }
+
+
 DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html lang="ko">
@@ -707,6 +929,7 @@ DASHBOARD_HTML = r"""
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: var(--surface2); }
   .tag { display: inline-flex; padding: 2px 8px; border-radius: 20px; font-size: 10px; font-weight: 700; }
+  .topo-badge { display:inline-flex; align-items:center; gap:4px; padding:3px 10px; border-radius:20px; font-size:11px; background:#0d1117; border:1px solid #30363d; color:#8b949e; }
   .tag-critical { background: rgba(248,81,73,.2); color: var(--red); }
   .tag-major { background: rgba(227,179,65,.2); color: var(--orange); }
   .tag-minor { background: rgba(88,166,255,.2); color: var(--accent); }
@@ -1546,7 +1769,8 @@ async function loadTabGraph(tab, canvasId, netKey) {
 
   let d;
   try {
-    const r = await fetch(`/api/graph?tab=${tab}`);
+    // /api/topology: NetworkX 지표가 포함된 노드 + 전역 메트릭 반환
+    const r = await fetch(`/api/topology?tab=${tab}`);
     d = await r.json();
   } catch(e) {
     container.innerHTML = `<div style="color:#f85149;padding:20px;">로딩 실패: ${e}</div>`;
@@ -1558,19 +1782,40 @@ async function loadTabGraph(tab, canvasId, netKey) {
     return;
   }
 
+  // ── 토폴로지 메트릭 패널 ──
+  const topo = d.topology || {};
+  const top5 = d.top_nodes || [];
+  const topoHtml = `
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;padding:10px;background:var(--bg-secondary);border-radius:6px;border:1px solid var(--border);">
+  <span style="color:var(--text-dim);font-size:11px;width:100%;font-weight:600;">NetworkX 토폴로지 분석</span>
+  <div class="topo-badge">노드 <b>${topo.node_count||0}</b></div>
+  <div class="topo-badge">엣지 <b>${topo.edge_count||0}</b></div>
+  <div class="topo-badge">밀도 <b>${(topo.density||0).toFixed(3)}</b></div>
+  <div class="topo-badge">컴포넌트 <b>${topo.components||1}</b></div>
+  <div class="topo-badge">최대CC <b>${topo.largest_component||0}</b></div>
+  <div class="topo-badge">평균차수 <b>${(topo.avg_degree||0).toFixed(1)}</b></div>
+  ${top5.length ? '<span style="color:var(--text-dim);font-size:11px;width:100%;margin-top:4px;">Top 중심 노드 (PageRank)</span>' : ''}
+  ${top5.map((n,i)=>`<div class="topo-badge" style="background:#161b22;">#${i+1} <b>${n.label}</b> PR:${n.pagerank.toFixed(3)}</div>`).join('')}
+</div>
+<div id="${canvasId}-net" style="width:100%;height:440px;background:var(--bg);border-radius:8px;overflow:hidden;border:1px solid var(--border);"></div>`;
+  container.innerHTML = topoHtml;
+
   await new Promise(res => setTimeout(res, 120));
-  const net = new vis.Network(container,
+  const netContainer = document.getElementById(canvasId + '-net');
+  if (!netContainer) return;
+
+  const net = new vis.Network(netContainer,
     { nodes: new vis.DataSet(d.nodes), edges: new vis.DataSet(d.edges) },
     { physics: { barnesHut: { gravitationalConstant: -5000, springLength: 130, springConstant: 0.06, damping: 0.35 },
         stabilization: { iterations: 220 } },
-      interaction: { hover: true, navigationButtons: true, zoomView: true },
-      nodes: { borderWidth: 2, size: 18 },
+      interaction: { hover: true, navigationButtons: true, zoomView: true, tooltipDelay: 100 },
+      nodes: { borderWidth: 2 },
       edges: { width: 1.5 },
     });
   window[netKey] = net;
 
   net.once('stabilizationIterationsDone', () => setTimeout(() => {
-    const c = document.getElementById(canvasId);
+    const c = document.getElementById(canvasId + '-net');
     if (!c) return;
     net.setSize(c.offsetWidth + 'px', c.offsetHeight + 'px');
     net.redraw();
