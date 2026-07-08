@@ -487,7 +487,7 @@ DASHBOARD_HTML = r"""
   .pill.hr        { border-color: #e3b341; color: #e3b341; }
 
   /* ── KG 그래프 캔버스 ── */
-  #kg-canvas-wrap { width: 100%; height: 520px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; position: relative; }
+  #kg-canvas-wrap { width: 100%; height: 1040px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; position: relative; }
   #kg-canvas { width: 100%; height: 100%; }
   #kg-legend { position: absolute; top: 12px; right: 12px; background: rgba(13,17,23,.9); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; font-size: 11px; max-height: 240px; overflow-y: auto; }
   .legend-item { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
