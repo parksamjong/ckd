@@ -1,0 +1,1816 @@
+"""
+CKD-NEXT 종합 운영 대시보드
+FastAPI + WebSocket 실시간 모니터링
++ RDF/OWL 온톨로지 + NetworkX 지식 그래프 + Neo4j Cypher + Vector RAG + GraphRAG
+"""
+import asyncio
+import json
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+# KG 모듈 (지연 임포트 — 서버 시작 속도 유지)
+_kg_modules_loaded = False
+_ontology_mod = None
+_builder_mod = None
+_vectorrag_mod = None
+_neo4j_mod = None
+_graphrag_mod = None
+
+
+def _load_kg_modules():
+    global _kg_modules_loaded, _ontology_mod, _builder_mod, _vectorrag_mod, _neo4j_mod, _graphrag_mod
+    if not _kg_modules_loaded:
+        import kg_ontology as _o
+        import kg_builder as _b
+        import kg_vectorrag as _v
+        import kg_neo4j as _n
+        import kg_graphrag as _g
+        _ontology_mod = _o
+        _builder_mod = _b
+        _vectorrag_mod = _v
+        _neo4j_mod = _n
+        _graphrag_mod = _g
+        _kg_modules_loaded = True
+
+app = FastAPI(title="CKD-NEXT 대시보드", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DB_CONFIG = {
+    "host": "127.0.0.1",
+    "port": 5432,
+    "database": "ckd_next",
+    "user": "postgres",
+    "password": "1234",
+}
+
+
+def get_conn():
+    return psycopg2.connect(**DB_CONFIG, cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def fetch_kpis():
+    """전체 KPI 데이터 수집"""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    data = {}
+
+    # ── 매출 KPI ──
+    cur.execute("""
+        SELECT
+          COUNT(*) AS total_orders,
+          SUM(CASE WHEN overall_status NOT IN ('C','X') THEN 1 ELSE 0 END) AS open_orders,
+          SUM(CASE WHEN overall_status = 'C' THEN 1 ELSE 0 END) AS completed_orders,
+          COALESCE(SUM(total_net_amount), 0) AS total_net_value
+        FROM sales_order
+    """)
+    data["sales"] = dict(cur.fetchone())
+
+    cur.execute("""
+        SELECT billing_date::text AS date,
+               SUM(total_value) AS daily_revenue
+        FROM billing_document
+        GROUP BY billing_date
+        ORDER BY billing_date
+    """)
+    data["billing_trend"] = [dict(r) for r in cur.fetchall()]
+
+    # ── 재무 KPI ──
+    cur.execute("""
+        SELECT
+          COALESCE(SUM(open_amount), 0) AS ar_open,
+          COALESCE(SUM(cleared_amount), 0) AS ar_cleared,
+          COUNT(*) AS ar_count,
+          SUM(CASE WHEN ar_status = 'OPEN' THEN 1 ELSE 0 END) AS ar_open_count
+        FROM accounts_receivable
+    """)
+    data["finance_ar"] = dict(cur.fetchone())
+
+    cur.execute("""
+        SELECT
+          COALESCE(SUM(gross_amount), 0) AS ap_total,
+          SUM(CASE WHEN clearing_status = 'O' THEN gross_amount ELSE 0 END) AS ap_open,
+          COUNT(*) AS ap_count
+        FROM accounts_payable_document
+    """)
+    data["finance_ap"] = dict(cur.fetchone())
+
+    cur.execute("""
+        SELECT document_type,
+               SUM(COALESCE(debit_amount,0)) AS total_debit
+        FROM gl_posting
+        WHERE document_type IN ('RV','KR','SA','AF','WA')
+        GROUP BY document_type
+        ORDER BY total_debit DESC
+    """)
+    data["gl_by_type"] = [dict(r) for r in cur.fetchall()]
+
+    # ── 생산 KPI ──
+    cur.execute("""
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN status IN ('REL','PCNF') THEN 1 ELSE 0 END) AS in_progress,
+          SUM(CASE WHEN status = 'TECO' THEN 1 ELSE 0 END) AS completed,
+          SUM(CASE WHEN status = 'CRTD' THEN 1 ELSE 0 END) AS created
+        FROM production_order
+    """)
+    data["production"] = dict(cur.fetchone())
+
+    cur.execute("""
+        SELECT order_type,
+               COUNT(*) AS cnt,
+               COALESCE(SUM(order_qty), 0) AS planned,
+               COALESCE(SUM(confirmed_qty), 0) AS confirmed
+        FROM production_order
+        GROUP BY order_type
+    """)
+    data["production_by_type"] = [dict(r) for r in cur.fetchall()]
+
+    # ── 품질 KPI ──
+    cur.execute("""
+        SELECT
+          COUNT(*) AS total_deviations,
+          SUM(CASE WHEN severity = 'CRITICAL' THEN 1 ELSE 0 END) AS critical,
+          SUM(CASE WHEN severity = 'MAJOR' THEN 1 ELSE 0 END) AS major,
+          SUM(CASE WHEN severity = 'MINOR' THEN 1 ELSE 0 END) AS minor,
+          SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_dev,
+          SUM(CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END) AS closed_dev
+        FROM deviation_report
+    """)
+    data["quality_deviation"] = dict(cur.fetchone())
+
+    cur.execute("""
+        SELECT
+          COUNT(*) AS total_oos,
+          SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_oos,
+          SUM(CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END) AS closed_oos,
+          SUM(CASE WHEN assignable_cause IS NULL THEN 1 ELSE 0 END) AS critical_oos
+        FROM out_of_specification
+    """)
+    data["quality_oos"] = dict(cur.fetchone())
+
+    cur.execute("""
+        SELECT
+          COUNT(*) AS total_complaints,
+          SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_complaints,
+          SUM(CASE WHEN recall_required = true THEN 1 ELSE 0 END) AS critical_complaints
+        FROM product_complaint
+    """)
+    data["quality_complaint"] = dict(cur.fetchone())
+
+    cur.execute("""
+        SELECT
+          COUNT(*) AS total_capa,
+          SUM(CASE WHEN status = 'OPEN' OR status = 'IN_PROGRESS' THEN 1 ELSE 0 END) AS open_capa,
+          SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed_capa,
+          SUM(CASE WHEN target_date < CURRENT_DATE AND status != 'COMPLETED' THEN 1 ELSE 0 END) AS overdue_capa
+        FROM capa_action
+    """)
+    data["quality_capa"] = dict(cur.fetchone())
+
+    # ── HR KPI ──
+    cur.execute("""
+        SELECT
+          COUNT(*) AS total_emp
+        FROM employee
+    """)
+    data["hr"] = dict(cur.fetchone())
+
+    cur.execute("""
+        SELECT
+          COUNT(*) AS total_leaves,
+          SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) AS pending_leaves
+        FROM leave_request
+    """)
+    data["hr_leave"] = dict(cur.fetchone())
+
+    # ── 최근 Deviation (실시간 모니터링용) ──
+    cur.execute("""
+        SELECT deviation_id, description AS title, severity, status, detected_date::text
+        FROM deviation_report
+        ORDER BY detected_date DESC
+        LIMIT 8
+    """)
+    data["recent_deviations"] = [dict(r) for r in cur.fetchall()]
+
+    # ── 최근 GL 전표 ──
+    cur.execute("""
+        SELECT DISTINCT document_number, document_type, posting_date::text,
+               header_text,
+               SUM(COALESCE(debit_amount,0)) AS total_debit
+        FROM gl_posting
+        GROUP BY document_number, document_type, posting_date, header_text
+        ORDER BY posting_date DESC
+        LIMIT 10
+    """)
+    data["recent_journals"] = [dict(r) for r in cur.fetchall()]
+
+    # ── Open PO 현황 ──
+    cur.execute("""
+        SELECT po_id, vendor_id, po_date::text, total_value AS total_amount,
+               po_status AS status, currency
+        FROM purchase_order
+        WHERE po_status NOT IN ('COMPLETED', 'CANCELLED', 'CLOSED')
+        ORDER BY po_date DESC
+        LIMIT 6
+    """)
+    data["open_pos"] = [dict(r) for r in cur.fetchall()]
+
+    # ── QM 검사 현황 ──
+    cur.execute("""
+        SELECT lot_id, material_id, plant_id, usage_decision AS lot_status,
+               inspection_start::text AS planned_start
+        FROM qm_inspection_lot
+        ORDER BY inspection_start DESC NULLS LAST
+        LIMIT 6
+    """)
+    data["inspection_lots"] = [dict(r) for r in cur.fetchall()]
+
+    conn.close()
+    data["timestamp"] = datetime.now().isoformat()
+    return data
+
+
+# WebSocket 연결 관리
+class ConnectionManager:
+    def __init__(self):
+        self.active: list[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        self.active.remove(ws)
+
+    async def broadcast(self, data: dict):
+        msg = json.dumps(data, default=str, ensure_ascii=False)
+        for ws in self.active[:]:
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                self.active.remove(ws)
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/ws/monitor")
+async def websocket_monitor(ws: WebSocket):
+    await manager.connect(ws)
+    try:
+        while True:
+            kpis = fetch_kpis()
+            await ws.send_text(json.dumps(kpis, default=str, ensure_ascii=False))
+            await asyncio.sleep(5)  # 5초마다 실시간 갱신
+    except WebSocketDisconnect:
+        manager.disconnect(ws)
+
+
+@app.get("/api/kpis")
+def api_kpis():
+    return fetch_kpis()
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    return HTMLResponse(content=DASHBOARD_HTML)
+
+
+# ══════════════════════════════════════════════════════════════
+# KG API 엔드포인트
+# ══════════════════════════════════════════════════════════════
+
+@app.get("/api/ontology")
+def api_ontology():
+    _load_kg_modules()
+    return _ontology_mod.get_ontology_summary()
+
+
+@app.get("/api/kg/graph")
+def api_kg_graph():
+    _load_kg_modules()
+    G, vis_data, metrics = _builder_mod.get_graph_cache()
+    return {"vis": vis_data, "metrics": metrics}
+
+
+@app.get("/api/kg/metrics")
+def api_kg_metrics():
+    _load_kg_modules()
+    _, _, metrics = _builder_mod.get_graph_cache()
+    return metrics
+
+
+@app.get("/api/vectorrag/stats")
+def api_vectorrag_stats():
+    _load_kg_modules()
+    idx = _vectorrag_mod.get_vector_index()
+    return idx.get_stats()
+
+
+@app.get("/api/vectorrag/search")
+def api_vectorrag_search(q: str = Query("일탈"), top_k: int = Query(8)):
+    _load_kg_modules()
+    return {"query": q, "results": _vectorrag_mod.vector_search(q, top_k=top_k)}
+
+
+@app.get("/api/neo4j/preview")
+def api_neo4j_preview():
+    _load_kg_modules()
+    return _neo4j_mod.get_neo4j_preview()
+
+
+@app.get("/api/neo4j/cypher", response_class=PlainTextResponse)
+def api_neo4j_cypher():
+    _load_kg_modules()
+    return _neo4j_mod.generate_cypher_script()
+
+
+@app.get("/api/graphrag/query")
+def api_graphrag_query(q: str = Query("Critical 일탈 CAPA 현황"), top_k: int = Query(8)):
+    _load_kg_modules()
+    return _graphrag_mod.graphrag_query(q, top_k=top_k)
+
+
+DASHBOARD_HTML = r"""
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CKD-NEXT 종합 운영 대시보드</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #21262d;
+    --border: #30363d;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --orange: #e3b341;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 13px; }
+
+  /* ── Header ── */
+  .header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky; top: 0; z-index: 100;
+  }
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .logo { width: 32px; height: 32px; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 900; color: #fff; font-size: 16px; }
+  .header h1 { font-size: 16px; font-weight: 700; color: #fff; }
+  .header .sub { font-size: 11px; color: var(--text-dim); }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.6;transform:scale(1.2)} }
+  .status-label { font-size: 11px; color: var(--green); font-weight: 600; }
+  .last-update { font-size: 11px; color: var(--text-dim); }
+
+  /* ── Tab Navigation ── */
+  .tabs { display: flex; gap: 4px; padding: 12px 24px 0; background: var(--surface); border-bottom: 1px solid var(--border); }
+  .tab { padding: 8px 16px; border-radius: 6px 6px 0 0; cursor: pointer; color: var(--text-dim); font-weight: 500; border: 1px solid transparent; border-bottom: none; transition: all .2s; }
+  .tab:hover { color: var(--text); background: var(--surface2); }
+  .tab.active { color: var(--accent); background: var(--bg); border-color: var(--border); }
+
+  /* ── Layout ── */
+  .main { padding: 20px 24px; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* ── Grid ── */
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+  .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 16px; }
+  .grid-21 { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .grid-12 { display: grid; grid-template-columns: 1fr 2fr; gap: 12px; margin-bottom: 16px; }
+  @media(max-width:900px){.grid-4,.grid-3{grid-template-columns:repeat(2,1fr)}.grid-2,.grid-21,.grid-12{grid-template-columns:1fr}}
+
+  /* ── KPI Card ── */
+  .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .kpi .label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 8px; }
+  .kpi .value { font-size: 26px; font-weight: 700; color: #fff; line-height: 1; }
+  .kpi .sub-value { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+  .kpi .badge { display: inline-flex; padding: 2px 8px; border-radius: 12px; font-size: 10px; font-weight: 600; margin-top: 6px; }
+  .badge-green { background: rgba(63,185,80,.15); color: var(--green); }
+  .badge-red { background: rgba(248,81,73,.15); color: var(--red); }
+  .badge-yellow { background: rgba(210,153,34,.15); color: var(--yellow); }
+  .badge-blue { background: rgba(88,166,255,.15); color: var(--accent); }
+
+  /* ── Section Card ── */
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .card-title { font-size: 13px; font-weight: 600; color: #fff; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+  .card-title .icon { font-size: 16px; }
+  canvas { max-height: 220px; }
+
+  /* ── Table ── */
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { color: var(--text-dim); font-weight: 600; text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 11px; text-transform: uppercase; letter-spacing: .3px; }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); color: var(--text); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--surface2); }
+  .tag { display: inline-flex; padding: 2px 8px; border-radius: 20px; font-size: 10px; font-weight: 700; }
+  .tag-critical { background: rgba(248,81,73,.2); color: var(--red); }
+  .tag-major { background: rgba(227,179,65,.2); color: var(--orange); }
+  .tag-minor { background: rgba(88,166,255,.2); color: var(--accent); }
+  .tag-open { background: rgba(248,81,73,.15); color: var(--red); }
+  .tag-closed { background: rgba(63,185,80,.15); color: var(--green); }
+  .tag-inprog { background: rgba(88,166,255,.15); color: var(--accent); }
+
+  /* ── Real-time Monitor ── */
+  .monitor-bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--surface2); border-radius: 6px; margin-bottom: 6px; border-left: 3px solid var(--border); transition: all .3s; }
+  .monitor-bar.critical { border-left-color: var(--red); }
+  .monitor-bar.major { border-left-color: var(--orange); }
+  .monitor-bar.minor { border-left-color: var(--accent); }
+  .monitor-bar .m-title { flex: 1; font-weight: 500; }
+  .monitor-bar .m-time { color: var(--text-dim); font-size: 11px; }
+
+  .alert-feed { max-height: 320px; overflow-y: auto; }
+  .alert-item { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid var(--border); animation: fadeIn .5s; }
+  @keyframes fadeIn { from{opacity:0;transform:translateY(-4px)} to{opacity:1;transform:none} }
+  .alert-icon { font-size: 18px; }
+  .alert-text .title { font-weight: 600; font-size: 12px; color: #fff; }
+  .alert-text .desc { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+  .alert-time { color: var(--text-dim); font-size: 11px; margin-left: auto; white-space: nowrap; }
+
+  /* ── Gauge ── */
+  .gauge-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .gauge-label { width: 120px; font-size: 11px; color: var(--text-dim); }
+  .gauge-bar { flex: 1; height: 8px; background: var(--surface2); border-radius: 4px; overflow: hidden; }
+  .gauge-fill { height: 100%; border-radius: 4px; transition: width .8s; }
+  .gauge-val { width: 50px; text-align: right; font-size: 11px; font-weight: 600; }
+
+  /* ── Mini Stats ── */
+  .mini-stat { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .mini-stat:last-child { border-bottom: none; }
+  .mini-stat .ms-label { color: var(--text-dim); font-size: 12px; }
+  .mini-stat .ms-val { font-weight: 700; color: #fff; font-size: 13px; }
+
+  /* ── Chart container ── */
+  .chart-wrap { position: relative; height: 200px; }
+
+  /* ── KG 탭 구분 ── */
+  .kg-tab { border-left: 1px solid var(--border); }
+  .kg-tab:first-of-type { margin-left: 8px; }
+
+  /* ── KG 공통 ── */
+  .kg-section { margin-bottom: 16px; }
+  .kg-header { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 10px; }
+  .pill { display: inline-flex; padding: 3px 10px; border-radius: 12px; font-size: 10px; font-weight: 700; margin: 2px; background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
+  .pill.material { border-color: #58a6ff; color: #58a6ff; }
+  .pill.quality   { border-color: #f85149; color: #f85149; }
+  .pill.finance   { border-color: #3fb950; color: #3fb950; }
+  .pill.production{ border-color: #bc8cff; color: #bc8cff; }
+  .pill.hr        { border-color: #e3b341; color: #e3b341; }
+
+  /* ── KG 그래프 캔버스 ── */
+  #kg-canvas-wrap { width: 100%; height: 520px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; position: relative; }
+  #kg-canvas { width: 100%; height: 100%; }
+  #kg-legend { position: absolute; top: 12px; right: 12px; background: rgba(13,17,23,.9); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; font-size: 11px; max-height: 240px; overflow-y: auto; }
+  .legend-item { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
+  /* ── Ontology 트리 ── */
+  .class-tree { display: flex; flex-wrap: wrap; gap: 6px; }
+  .onto-prop { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; font-size: 11px; }
+  .onto-prop-row { background: var(--surface2); border-radius: 4px; padding: 5px 8px; border-left: 2px solid var(--accent); }
+  .turtle-box { background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: 'Fira Code', 'Consolas', monospace; font-size: 10px; color: #7ee787; max-height: 280px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+
+  /* ── Cypher 코드 블록 ── */
+  .cypher-box { background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: 'Fira Code','Consolas', monospace; font-size: 10px; color: #79c0ff; max-height: 260px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+  .neo4j-connected { color: var(--green); font-weight: 700; }
+  .neo4j-offline { color: var(--yellow); font-weight: 700; }
+
+  /* ── Vector RAG ── */
+  .vec-result { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; margin-bottom: 6px; border-left: 3px solid var(--accent); }
+  .vec-score { float: right; font-size: 10px; font-weight: 700; color: var(--accent); }
+  .vec-type  { font-size: 10px; color: var(--text-dim); margin-bottom: 4px; }
+  .vec-text  { font-size: 11px; color: var(--text); }
+
+  /* ── GraphRAG ── */
+  .rag-query-wrap { display: flex; gap: 8px; margin-bottom: 16px; }
+  .rag-input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; color: var(--text); font-size: 13px; outline: none; }
+  .rag-input:focus { border-color: var(--accent); }
+  .rag-btn { background: var(--accent); color: #0d1117; border: none; border-radius: 8px; padding: 10px 20px; font-weight: 700; cursor: pointer; font-size: 13px; }
+  .rag-btn:hover { background: #79c0ff; }
+  .fused-item { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 11px; }
+  .fused-rank { width: 24px; height: 24px; border-radius: 50%; background: var(--surface2); display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; flex-shrink: 0; }
+  .source-badge { padding: 2px 6px; border-radius: 4px; font-size: 9px; font-weight: 700; }
+  .src-vector { background: rgba(88,166,255,.2); color: var(--accent); }
+  .src-graph  { background: rgba(188,140,255,.2); color: var(--purple); }
+  .src-both   { background: rgba(63,185,80,.2); color: var(--green); }
+  .prompt-box { background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: 'Consolas', monospace; font-size: 10px; color: #e3b341; max-height: 200px; overflow-y: auto; white-space: pre-wrap; }
+
+  /* ── 메트릭 그리드 ── */
+  .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+  .metric-box { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; text-align: center; }
+  .metric-box .mv { font-size: 22px; font-weight: 700; color: #fff; }
+  .metric-box .ml { font-size: 10px; color: var(--text-dim); margin-top: 2px; text-transform: uppercase; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="logo">CK</div>
+    <div>
+      <h1>CKD-NEXT 종합 운영 대시보드</h1>
+      <div class="sub">종근당 차세대 AI·SAP 통합 플랫폼 | Company Code 1000</div>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:16px;">
+    <div style="display:flex;align-items:center;gap:6px;">
+      <div class="status-dot" id="connDot"></div>
+      <span class="status-label" id="connLabel">연결 중...</span>
+    </div>
+    <div class="last-update" id="lastUpdate">-</div>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="showPanel('overview',this)">📊 전체 현황</div>
+  <div class="tab" onclick="showPanel('sales',this)">💰 영업·재무</div>
+  <div class="tab" onclick="showPanel('quality',this)">🧪 품질·GMP</div>
+  <div class="tab" onclick="showPanel('production',this)">🏭 생산·구매</div>
+  <div class="tab" onclick="showPanel('monitor',this)">🔴 실시간 모니터링</div>
+  <div class="tab kg-tab" onclick="showPanel('ontology',this)">🧬 OWL 온톨로지</div>
+  <div class="tab kg-tab" onclick="showPanel('kgraph',this)">🕸️ 지식 그래프</div>
+  <div class="tab kg-tab" onclick="showPanel('neo4j',this)">🗄️ Neo4j</div>
+  <div class="tab kg-tab" onclick="showPanel('vectorrag',this)">🔍 Vector RAG</div>
+  <div class="tab kg-tab" onclick="showPanel('graphrag',this)">🤖 GraphRAG</div>
+</div>
+
+<div class="main">
+
+  <!-- ══════════════════════════════════════════
+       PANEL: 전체 현황
+  ══════════════════════════════════════════ -->
+  <div class="panel active" id="panel-overview">
+    <div class="grid-4">
+      <div class="kpi">
+        <div class="label">수주 (총)</div>
+        <div class="value" id="ov-so-total">-</div>
+        <div class="sub-value" id="ov-so-open">진행중: -건</div>
+        <span class="badge badge-blue" id="ov-so-badge">-</span>
+      </div>
+      <div class="kpi">
+        <div class="label">수익 계정 잔액 (전표 합)</div>
+        <div class="value" id="ov-revenue">-</div>
+        <div class="sub-value">전표 유형: RV</div>
+        <span class="badge badge-green">매출전표</span>
+      </div>
+      <div class="kpi">
+        <div class="label">일탈 보고서 (미결)</div>
+        <div class="value" id="ov-dev-open">-</div>
+        <div class="sub-value" id="ov-dev-crit">Critical: -건</div>
+        <span class="badge" id="ov-dev-badge">-</span>
+      </div>
+      <div class="kpi">
+        <div class="label">생산 오더 (진행중)</div>
+        <div class="value" id="ov-prod-ip">-</div>
+        <div class="sub-value" id="ov-prod-total">총 - 건</div>
+        <span class="badge badge-blue">REL/PCNF</span>
+      </div>
+    </div>
+
+    <div class="grid-4">
+      <div class="kpi">
+        <div class="label">매출채권 (미수)</div>
+        <div class="value" id="ov-ar-open">-</div>
+        <div class="sub-value" id="ov-ar-cnt">건</div>
+        <span class="badge badge-yellow">AR OPEN</span>
+      </div>
+      <div class="kpi">
+        <div class="label">매입채무 (미결</div>
+        <div class="value" id="ov-ap-open">-</div>
+        <div class="sub-value" id="ov-ap-total">총 채무</div>
+        <span class="badge badge-yellow">AP OPEN</span>
+      </div>
+      <div class="kpi">
+        <div class="label">OOS (미결)</div>
+        <div class="value" id="ov-oos-open">-</div>
+        <div class="sub-value" id="ov-oos-total">총 - 건</div>
+        <span class="badge badge-red">OOS OPEN</span>
+      </div>
+      <div class="kpi">
+        <div class="label">CAPA (과기)</div>
+        <div class="value" id="ov-capa-od">-</div>
+        <div class="sub-value" id="ov-capa-total">총 - 건</div>
+        <span class="badge badge-red">OVERDUE</span>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title"><span class="icon">📅</span>청구 일별 추이</div>
+        <div class="chart-wrap"><canvas id="billingChart"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">📋</span>전표 유형별 금액</div>
+        <div class="chart-wrap"><canvas id="glTypeChart"></canvas></div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title"><span class="icon">🚨</span>최근 일탈 보고서</div>
+        <table>
+          <thead><tr><th>ID</th><th>제목</th><th>심각도</th><th>상태</th><th>감지일</th></tr></thead>
+          <tbody id="devTable"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">📒</span>최근 회계 전표</div>
+        <table>
+          <thead><tr><th>전표번호</th><th>유형</th><th>일자</th><th>차변</th></tr></thead>
+          <tbody id="jvTable"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       PANEL: 영업·재무
+  ══════════════════════════════════════════ -->
+  <div class="panel" id="panel-sales">
+    <div class="grid-3">
+      <div class="kpi">
+        <div class="label">총 수주 건수</div>
+        <div class="value" id="s-so-total">-</div>
+        <div class="sub-value" id="s-so-open">진행중 건</div>
+      </div>
+      <div class="kpi">
+        <div class="label">수주 총액</div>
+        <div class="value" id="s-so-amt">-</div>
+        <div class="sub-value">Net Value (KRW)</div>
+        <span class="badge badge-green">확정</span>
+      </div>
+      <div class="kpi">
+        <div class="label">세금계산서 발행</div>
+        <div class="value" id="s-inv-cnt">-</div>
+        <div class="sub-value" id="s-inv-paid">결제완료 -건</div>
+        <span class="badge badge-blue">Invoice</span>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title"><span class="icon">📈</span>일별 매출 (청구 기준)</div>
+        <div class="chart-wrap"><canvas id="salesChart2"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">💵</span>AR / AP 현황</div>
+        <div class="chart-wrap"><canvas id="arApChart"></canvas></div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title"><span class="icon">📤</span>매출채권 목록</div>
+        <table>
+          <thead><tr><th>고객</th><th>Invoice</th><th>전기일</th><th>미수금</th><th>상태</th></tr></thead>
+          <tbody id="arTable"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">📥</span>매입채무 목록</div>
+        <table>
+          <thead><tr><th>AP Doc</th><th>공급사</th><th>총액</th><th>결제기한</th><th>상태</th></tr></thead>
+          <tbody id="apTable"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       PANEL: 품질·GMP
+  ══════════════════════════════════════════ -->
+  <div class="panel" id="panel-quality">
+    <div class="grid-4">
+      <div class="kpi">
+        <div class="label">일탈 보고서 (총)</div>
+        <div class="value" id="q-dev-total">-</div>
+        <div class="sub-value" id="q-dev-breakdown">C/M/m: -/-/-</div>
+        <span class="badge" id="q-dev-badge">-</span>
+      </div>
+      <div class="kpi">
+        <div class="label">OOS 결과 (총)</div>
+        <div class="value" id="q-oos-total">-</div>
+        <div class="sub-value" id="q-oos-open">OPEN: -건</div>
+        <span class="badge" id="q-oos-badge">-</span>
+      </div>
+      <div class="kpi">
+        <div class="label">제품 민원 (총)</div>
+        <div class="value" id="q-comp-total">-</div>
+        <div class="sub-value" id="q-comp-open">OPEN: -건</div>
+        <span class="badge" id="q-comp-badge">-</span>
+      </div>
+      <div class="kpi">
+        <div class="label">CAPA Action</div>
+        <div class="value" id="q-capa-total">-</div>
+        <div class="sub-value" id="q-capa-od">과기: -건</div>
+        <span class="badge" id="q-capa-badge">-</span>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title"><span class="icon">🔴</span>일탈 심각도 분포</div>
+        <div class="chart-wrap"><canvas id="devSevChart"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">📊</span>품질 게이지</div>
+        <div id="qualGauge"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><span class="icon">📋</span>최근 일탈 보고서 상세</div>
+      <table>
+        <thead><tr><th>ID</th><th>제목</th><th>심각도</th><th>상태</th><th>감지일</th></tr></thead>
+        <tbody id="devTableFull"></tbody>
+      </table>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title"><span class="icon">🔬</span>QM 검사 로트</div>
+        <table>
+          <thead><tr><th>Lot ID</th><th>자재</th><th>플랜트</th><th>상태</th><th>계획일</th></tr></thead>
+          <tbody id="lotTable"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">✅</span>CAPA 현황</div>
+        <div id="capaStatus"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       PANEL: 생산·구매
+  ══════════════════════════════════════════ -->
+  <div class="panel" id="panel-production">
+    <div class="grid-4">
+      <div class="kpi">
+        <div class="label">생산 오더 (총)</div>
+        <div class="value" id="p-total">-</div>
+        <div class="sub-value" id="p-crtd">생성: -건</div>
+      </div>
+      <div class="kpi">
+        <div class="label">진행중 (REL/PCNF)</div>
+        <div class="value" id="p-ip">-</div>
+        <div class="sub-value">릴리즈/확인</div>
+        <span class="badge badge-blue">IN PROGRESS</span>
+      </div>
+      <div class="kpi">
+        <div class="label">완료 (TECO)</div>
+        <div class="value" id="p-teco">-</div>
+        <div class="sub-value">기술 완료</div>
+        <span class="badge badge-green">COMPLETED</span>
+      </div>
+      <div class="kpi">
+        <div class="label">Open PO (미결)</div>
+        <div class="value" id="p-po-cnt">-</div>
+        <div class="sub-value">발주 잔량</div>
+        <span class="badge badge-yellow">OPEN</span>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title"><span class="icon">🏭</span>생산 오더 유형별</div>
+        <div class="chart-wrap"><canvas id="prodTypeChart"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">📦</span>미결 구매 오더</div>
+        <table>
+          <thead><tr><th>PO ID</th><th>공급사</th><th>일자</th><th>금액</th><th>상태</th></tr></thead>
+          <tbody id="poTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><span class="icon">🔬</span>QM 검사 로트 현황</div>
+      <table>
+        <thead><tr><th>Lot ID</th><th>자재 ID</th><th>플랜트</th><th>상태</th><th>계획 시작일</th></tr></thead>
+        <tbody id="lotTable2"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       PANEL: 실시간 모니터링
+  ══════════════════════════════════════════ -->
+  <div class="panel" id="panel-monitor">
+    <div class="grid-4" style="margin-bottom:16px;">
+      <div class="kpi" style="border-color:var(--green)">
+        <div class="label">DB 연결 상태</div>
+        <div class="value" id="mon-conn" style="color:var(--green)">●  LIVE</div>
+        <div class="sub-value">PostgreSQL ckd_next</div>
+      </div>
+      <div class="kpi">
+        <div class="label">마지막 업데이트</div>
+        <div class="value" style="font-size:16px" id="mon-ts">-</div>
+        <div class="sub-value">5초 갱신 주기</div>
+      </div>
+      <div class="kpi">
+        <div class="label">활성 WebSocket</div>
+        <div class="value" id="mon-ws">1</div>
+        <div class="sub-value">클라이언트 수</div>
+      </div>
+      <div class="kpi">
+        <div class="label">총 이벤트 수신</div>
+        <div class="value" id="mon-events">0</div>
+        <div class="sub-value">누적 갱신 횟수</div>
+      </div>
+    </div>
+
+    <div class="grid-21">
+      <div class="card">
+        <div class="card-title"><span class="icon">📡</span>실시간 알림 피드 <span style="font-size:10px;color:var(--text-dim);font-weight:400">(최신순)</span></div>
+        <div class="alert-feed" id="alertFeed"></div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">📊</span>실시간 KPI 스냅샷</div>
+        <div id="kpiSnap"></div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title"><span class="icon">🚨</span>일탈 실시간 현황</div>
+        <div id="devMonitor"></div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">💹</span>실시간 재무 지표</div>
+        <div id="finMonitor"></div>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ══════════════════════════════════════════
+       PANEL: RDF/OWL 온톨로지
+  ══════════════════════════════════════════ -->
+  <div class="panel" id="panel-ontology">
+    <div class="grid-4" id="onto-kpi" style="margin-bottom:16px;">
+      <div class="kpi"><div class="label">OWL 클래스</div><div class="value" id="onto-cls">-</div><div class="sub-value">도메인 엔티티</div></div>
+      <div class="kpi"><div class="label">객체 속성</div><div class="value" id="onto-op">-</div><div class="sub-value">관계 (ObjectProperty)</div></div>
+      <div class="kpi"><div class="label">데이터 속성</div><div class="value" id="onto-dp">-</div><div class="sub-value">데이터 값 (DataProperty)</div></div>
+      <div class="kpi"><div class="label">네임스페이스</div><div class="value" style="font-size:14px">CKD-NEXT</div><div class="sub-value">ckd-next.co.kr/ontology/</div></div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title"><span class="icon">🧬</span>OWL 클래스 목록</div>
+        <div class="class-tree" id="onto-classes"></div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">🔗</span>객체 속성 (ObjectProperty)</div>
+        <div class="onto-prop" id="onto-obj-props"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title"><span class="icon">📄</span>Turtle 직렬화 (OWL 스니펫)</div>
+      <div class="turtle-box" id="onto-turtle">로딩 중...</div>
+    </div>
+    <div class="card">
+      <div class="card-title"><span class="icon">📐</span>데이터 속성 (DatatypeProperty)</div>
+      <table><thead><tr><th>속성명</th><th>도메인 클래스</th><th>설명</th></tr></thead>
+      <tbody id="onto-data-props"></tbody></table>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       PANEL: 지식 그래프 (NetworkX → vis.js)
+  ══════════════════════════════════════════ -->
+  <div class="panel" id="panel-kgraph">
+    <div class="metric-grid" id="kg-metrics-row">
+      <div class="metric-box"><div class="mv" id="kg-nodes">-</div><div class="ml">노드</div></div>
+      <div class="metric-box"><div class="mv" id="kg-edges">-</div><div class="ml">엣지</div></div>
+      <div class="metric-box"><div class="mv" id="kg-density">-</div><div class="ml">밀도</div></div>
+      <div class="metric-box"><div class="mv" id="kg-wcc">-</div><div class="ml">연결 컴포넌트</div></div>
+    </div>
+    <div class="grid-21">
+      <div id="kg-canvas-wrap">
+        <div id="kg-canvas"></div>
+        <div id="kg-legend"></div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:12px;">
+        <div class="card" style="margin:0">
+          <div class="card-title"><span class="icon">📊</span>노드 타입별</div>
+          <div id="kg-type-dist"></div>
+        </div>
+        <div class="card" style="margin:0">
+          <div class="card-title"><span class="icon">🏆</span>PageRank 상위</div>
+          <div id="kg-pagerank"></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title"><span class="icon">🔗</span>관계 유형별 엣지 수</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;" id="kg-rel-counts"></div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       PANEL: Neo4j Cypher
+  ══════════════════════════════════════════ -->
+  <div class="panel" id="panel-neo4j">
+    <div class="grid-4" style="margin-bottom:16px;">
+      <div class="kpi">
+        <div class="label">Neo4j 연결</div>
+        <div class="value" style="font-size:16px" id="neo4j-status-val">확인 중...</div>
+        <div class="sub-value" id="neo4j-uri">bolt://localhost:7687</div>
+      </div>
+      <div class="kpi"><div class="label">Cypher 스크립트 줄</div><div class="value" id="neo4j-lines">-</div><div class="sub-value">생성된 쿼리</div></div>
+      <div class="kpi"><div class="label">노드 MERGE 구문</div><div class="value" id="neo4j-nodes">-</div><div class="sub-value">CREATE/MERGE</div></div>
+      <div class="kpi"><div class="label">관계 구문</div><div class="value" id="neo4j-rels">-</div><div class="sub-value">-[:REL]-></div></div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title"><span class="icon">📋</span>샘플 Cypher 쿼리</div>
+        <div id="neo4j-queries"></div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">🗄️</span>인덱스·제약 정의</div>
+        <div class="cypher-box" id="neo4j-constraints">로딩 중...</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title"><span class="icon">📝</span>생성된 Cypher 스크립트 미리보기 <button onclick="downloadCypher()" style="float:right;background:var(--accent);border:none;border-radius:6px;padding:4px 12px;color:#000;font-weight:700;cursor:pointer;font-size:11px;">⬇ 다운로드</button></div>
+      <div class="cypher-box" id="neo4j-script">로딩 중...</div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       PANEL: Vector RAG
+  ══════════════════════════════════════════ -->
+  <div class="panel" id="panel-vectorrag">
+    <div class="grid-4" style="margin-bottom:16px;">
+      <div class="kpi"><div class="label">벡터 문서 수</div><div class="value" id="vr-docs">-</div><div class="sub-value">임베딩된 엔티티</div></div>
+      <div class="kpi"><div class="label">어휘 사전 크기</div><div class="value" id="vr-vocab">-</div><div class="sub-value">TF-IDF n-gram</div></div>
+      <div class="kpi"><div class="label">행렬 차원</div><div class="value" style="font-size:14px" id="vr-shape">-</div><div class="sub-value">문서 × 어휘</div></div>
+      <div class="kpi"><div class="label">임베딩 방식</div><div class="value" style="font-size:14px">TF-IDF</div><div class="sub-value">Char n-gram (2-4)</div></div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title"><span class="icon">📦</span>엔티티 타입별 문서 분포</div>
+        <div class="chart-wrap"><canvas id="vrDistChart"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">🔍</span>실시간 검색</div>
+        <div class="rag-query-wrap">
+          <input class="rag-input" id="vr-query" placeholder="검색어 입력 (예: Critical 일탈 원료 품질)" value="Critical 일탈 원료">
+          <button class="rag-btn" onclick="runVectorSearch()">검색</button>
+        </div>
+        <div id="vr-results"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title"><span class="icon">💡</span>예제 검색 쿼리</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;">
+        <button class="rag-btn" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);" onclick="vrQuickSearch('Critical 일탈 원료 품질 문제')">Critical 일탈</button>
+        <button class="rag-btn" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);" onclick="vrQuickSearch('매출 청구 세금계산서')">매출 재무</button>
+        <button class="rag-btn" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);" onclick="vrQuickSearch('생산 오더 완료 TECO')">생산 오더</button>
+        <button class="rag-btn" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);" onclick="vrQuickSearch('CAPA 조치 완료 담당자')">CAPA 조치</button>
+        <button class="rag-btn" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);" onclick="vrQuickSearch('Acetaminophen Atorvastatin 자재')">자재 검색</button>
+        <button class="rag-btn" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);" onclick="vrQuickSearch('감가상각 전표 비용')">회계 전표</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       PANEL: GraphRAG (Vector + Graph 융합)
+  ══════════════════════════════════════════ -->
+  <div class="panel" id="panel-graphrag">
+    <div class="card">
+      <div class="card-title"><span class="icon">🤖</span>GraphRAG 하이브리드 검색 (Vector + NetworkX BFS + RRF 융합)</div>
+      <div class="rag-query-wrap">
+        <input class="rag-input" id="gr-query" placeholder="자연어 질의 입력 (예: 아세트아미노펜 생산에서 발생한 Critical 일탈 CAPA 현황은?)" value="Critical 일탈 원료 품질 문제 CAPA 현황">
+        <button class="rag-btn" onclick="runGraphRAG()">🤖 GraphRAG 실행</button>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;">
+        <span style="font-size:11px;color:var(--text-dim)">예제:</span>
+        <button class="rag-btn" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:10px;padding:4px 8px;" onclick="grQuick('Critical 일탈 CAPA 현황')">Critical CAPA</button>
+        <button class="rag-btn" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:10px;padding:4px 8px;" onclick="grQuick('매출채권 미수금 현황')">AR 미수</button>
+        <button class="rag-btn" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:10px;padding:4px 8px;" onclick="grQuick('아토르바스타틴 생산 일탈')">생산 일탈</button>
+        <button class="rag-btn" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:10px;padding:4px 8px;" onclick="grQuick('GL 전표 매출원가 감가상각')">재무 전표</button>
+      </div>
+    </div>
+    <div class="grid-3" id="gr-stats-row" style="margin-bottom:12px;display:none;">
+      <div class="kpi"><div class="label">도메인 분류</div><div class="value" style="font-size:16px" id="gr-domain">-</div></div>
+      <div class="kpi"><div class="label">Vector 히트</div><div class="value" id="gr-v-hits">-</div><div class="sub-value">TF-IDF 유사도</div></div>
+      <div class="kpi"><div class="label">Graph 히트</div><div class="value" id="gr-g-hits">-</div><div class="sub-value">NetworkX BFS</div></div>
+    </div>
+    <div class="grid-21" id="gr-results-wrap" style="display:none;">
+      <div>
+        <div class="card" style="margin-bottom:12px;">
+          <div class="card-title"><span class="icon">🏆</span>RRF 융합 최종 순위</div>
+          <div id="gr-fused"></div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span class="icon">🕸️</span>Graph 이웃 노드</div>
+          <div id="gr-graph-hits"></div>
+        </div>
+      </div>
+      <div>
+        <div class="card">
+          <div class="card-title"><span class="icon">📝</span>생성된 RAG Prompt</div>
+          <div class="prompt-box" id="gr-prompt">-</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<script src="https://unpkg.com/vis-network@9.1.6/dist/vis-network.min.js"></script>
+<script>
+// ──────────────────────────────────────────
+// Chart.js 기본 설정 (다크 테마)
+// ──────────────────────────────────────────
+Chart.defaults.color = '#8b949e';
+Chart.defaults.borderColor = '#30363d';
+Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
+Chart.defaults.font.size = 11;
+
+let charts = {};
+let eventCount = 0;
+let kpiData = null;
+
+function fmt(n) {
+  if (n === null || n === undefined || n === '-') return '-';
+  n = Number(n);
+  if (n >= 1e9) return (n/1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(0) + 'K';
+  return n.toLocaleString('ko-KR');
+}
+function fmtW(n) {
+  if (!n) return '-';
+  n = Number(n);
+  return (n/1e4).toFixed(0) + '만';
+}
+function fmtKRW(n) {
+  if (!n) return '₩0';
+  return '₩' + Number(n).toLocaleString('ko-KR');
+}
+
+// ──────────────────────────────────────────
+// Tab (showPanel defined later with KG lazy-load support)
+
+// ──────────────────────────────────────────
+// WebSocket
+// ──────────────────────────────────────────
+function connectWS() {
+  const ws = new WebSocket('ws://127.0.0.1:8765/ws/monitor');
+  ws.onopen = () => {
+    document.getElementById('connDot').style.background = '#3fb950';
+    document.getElementById('connLabel').textContent = '실시간 연결됨';
+    document.getElementById('connLabel').style.color = '#3fb950';
+    document.getElementById('mon-conn').textContent = '● LIVE';
+  };
+  ws.onmessage = (e) => {
+    kpiData = JSON.parse(e.data);
+    eventCount++;
+    document.getElementById('mon-events').textContent = eventCount;
+    document.getElementById('mon-ts').textContent = kpiData.timestamp ? kpiData.timestamp.substring(11,19) : '-';
+    document.getElementById('lastUpdate').textContent = '업데이트: ' + (kpiData.timestamp || '').substring(11,19);
+    renderAll(kpiData);
+  };
+  ws.onclose = () => {
+    document.getElementById('connDot').style.background = '#f85149';
+    document.getElementById('connLabel').textContent = '연결 끊김 - 재연결 중...';
+    document.getElementById('connLabel').style.color = '#f85149';
+    setTimeout(connectWS, 3000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+// ──────────────────────────────────────────
+// 렌더링 메인
+// ──────────────────────────────────────────
+function renderAll(d) {
+  renderOverview(d);
+  renderSales(d);
+  renderQuality(d);
+  renderProduction(d);
+  renderMonitor(d);
+  renderCharts(d);
+}
+
+function renderOverview(d) {
+  const s = d.sales || {};
+  const fin = d.finance_ar || {};
+  const ap = d.finance_ap || {};
+  const dev = d.quality_deviation || {};
+  const oos = d.quality_oos || {};
+  const capa = d.quality_capa || {};
+  const prod = d.production || {};
+
+  setText('ov-so-total', s.total_orders || 0);
+  setText('ov-so-open', '진행중: ' + (s.open_orders || 0) + '건');
+  setText('ov-so-badge', '완료 ' + (s.completed_orders || 0) + '건');
+
+  // GL Posting 매출전표 총액
+  const rv = (d.gl_by_type || []).find(x => x.document_type === 'RV');
+  setText('ov-revenue', rv ? '₩' + fmt(rv.total_debit) : '-');
+
+  setText('ov-dev-open', dev.open_dev || 0);
+  setText('ov-dev-crit', 'Critical: ' + (dev.critical || 0) + '건');
+  const devBadge = document.getElementById('ov-dev-badge');
+  devBadge.textContent = (dev.critical > 0 ? 'CRITICAL 있음' : '정상');
+  devBadge.className = 'badge ' + (dev.critical > 0 ? 'badge-red' : 'badge-green');
+
+  setText('ov-prod-ip', prod.in_progress || 0);
+  setText('ov-prod-total', '총 ' + (prod.total || 0) + '건');
+
+  setText('ov-ar-open', fin.ar_open ? '₩' + fmt(fin.ar_open) : '-');
+  setText('ov-ar-cnt', (fin.ar_open_count || 0) + '건 미수');
+
+  setText('ov-ap-open', ap.ap_open ? '₩' + fmt(ap.ap_open) : '-');
+  setText('ov-ap-total', '총 ₩' + fmt(ap.ap_total));
+
+  setText('ov-oos-open', oos.open_oos || 0);
+  setText('ov-oos-total', '총 ' + (oos.total_oos || 0) + '건');
+
+  setText('ov-capa-od', capa.overdue_capa || 0);
+  setText('ov-capa-total', '총 ' + (capa.total_capa || 0) + '건');
+
+  // 일탈 테이블
+  renderDevTable('devTable', d.recent_deviations || [], 6);
+  // 전표 테이블
+  renderJvTable('jvTable', d.recent_journals || [], 8);
+}
+
+function renderSales(d) {
+  const s = d.sales || {};
+  const inv = d.billing_trend || [];
+  const ar = d.finance_ar || {};
+  const ap = d.finance_ap || {};
+
+  setText('s-so-total', s.total_orders || 0);
+  setText('s-so-open', '진행중 ' + (s.open_orders || 0) + '건');
+  setText('s-so-amt', s.total_net_value ? '₩' + fmt(s.total_net_value) : '-');
+  setText('s-inv-cnt', inv.length);
+  setText('s-inv-paid', '결제완료 -건');
+
+  // AR 테이블 - 실제 데이터
+  const arTbody = document.getElementById('arTable');
+  if (arTbody) {
+    arTbody.innerHTML = '';
+    (d.recent_journals || []).slice(0,6).forEach(j => {
+      if (j.document_type !== 'RV') return;
+      const tr = arTbody.insertRow();
+      tr.innerHTML = `<td>Cust</td><td>${j.document_number}</td><td>${j.posting_date||''}</td><td>${fmtKRW(j.total_debit)}</td><td><span class="tag tag-open">OPEN</span></td>`;
+    });
+  }
+
+  // AP 테이블 - journals
+  const apTbody = document.getElementById('apTable');
+  if (apTbody) {
+    apTbody.innerHTML = '';
+    (d.recent_journals || []).slice(0,5).forEach(j => {
+      if (j.document_type !== 'KR') return;
+      const tr = apTbody.insertRow();
+      tr.innerHTML = `<td>${j.document_number}</td><td>Vendor</td><td>${fmtKRW(j.total_debit)}</td><td>NT30</td><td><span class="tag tag-open">OPEN</span></td>`;
+    });
+  }
+}
+
+function renderQuality(d) {
+  const dev = d.quality_deviation || {};
+  const oos = d.quality_oos || {};
+  const comp = d.quality_complaint || {};
+  const capa = d.quality_capa || {};
+
+  setText('q-dev-total', dev.total_deviations || 0);
+  setText('q-dev-breakdown', 'C/M/m: ' + (dev.critical||0)+'/'+(dev.major||0)+'/'+(dev.minor||0));
+  setBadge('q-dev-badge', dev.open_dev > 0, dev.open_dev + '건 미결', 'badge-red', 'badge-green');
+
+  setText('q-oos-total', oos.total_oos || 0);
+  setText('q-oos-open', 'OPEN: ' + (oos.open_oos||0) + '건');
+  setBadge('q-oos-badge', oos.open_oos > 0, oos.open_oos + '건 OPEN', 'badge-red', 'badge-green');
+
+  setText('q-comp-total', comp.total_complaints || 0);
+  setText('q-comp-open', 'OPEN: ' + (comp.open_complaints||0) + '건');
+  setBadge('q-comp-badge', comp.critical_complaints > 0, 'Critical ' + comp.critical_complaints, 'badge-red', 'badge-blue');
+
+  setText('q-capa-total', capa.total_capa || 0);
+  setText('q-capa-od', '과기: ' + (capa.overdue_capa||0) + '건');
+  setBadge('q-capa-badge', capa.overdue_capa > 0, '과기 ' + capa.overdue_capa, 'badge-red', 'badge-green');
+
+  renderDevTable('devTableFull', d.recent_deviations || [], 8);
+
+  // 품질 게이지
+  const gaugeDiv = document.getElementById('qualGauge');
+  if (gaugeDiv) {
+    const total = dev.total_deviations || 1;
+    const openPct = Math.round(((dev.open_dev||0) / total) * 100);
+    const oosPct = Math.round(((oos.open_oos||0) / (oos.total_oos||1)) * 100);
+    const capaPct = Math.round(((capa.overdue_capa||0) / (capa.total_capa||1)) * 100);
+    gaugeDiv.innerHTML = `
+      ${gauge('일탈 미결율', openPct, openPct > 50 ? '#f85149' : '#3fb950')}
+      ${gauge('OOS 미결율', oosPct, oosPct > 50 ? '#f85149' : '#d29922')}
+      ${gauge('CAPA 완료율', Math.round(((capa.completed_capa||0)/(capa.total_capa||1))*100), '#58a6ff')}
+      ${gauge('CAPA 과기율', capaPct, capaPct > 20 ? '#f85149' : '#3fb950')}
+    `;
+  }
+
+  // QM 로트
+  renderLotTable('lotTable', d.inspection_lots || []);
+
+  // CAPA 상태
+  const capaDiv = document.getElementById('capaStatus');
+  if (capaDiv) {
+    capaDiv.innerHTML = `
+      ${miniStat('총 CAPA', capa.total_capa)}
+      ${miniStat('진행중', (capa.total_capa||0)-(capa.completed_capa||0)-(capa.overdue_capa||0))}
+      ${miniStat('완료', capa.completed_capa)}
+      ${miniStat('과기', capa.overdue_capa, true)}
+    `;
+  }
+}
+
+function renderProduction(d) {
+  const prod = d.production || {};
+  setText('p-total', prod.total || 0);
+  setText('p-crtd', '생성: ' + (prod.created||0) + '건');
+  setText('p-ip', prod.in_progress || 0);
+  setText('p-teco', prod.completed || 0);
+  setText('p-po-cnt', (d.open_pos || []).length);
+
+  const poTbody = document.getElementById('poTable');
+  if (poTbody) {
+    poTbody.innerHTML = '';
+    (d.open_pos || []).forEach(p => {
+      const tr = poTbody.insertRow();
+      tr.innerHTML = `<td>${p.po_id}</td><td>${p.vendor_id||'-'}</td><td>${p.po_date||''}</td><td>${fmtKRW(p.total_amount)}</td><td><span class="tag tag-open">${p.status||'OPEN'}</span></td>`;
+    });
+  }
+
+  renderLotTable('lotTable2', d.inspection_lots || []);
+}
+
+function renderMonitor(d) {
+  // KPI 스냅샷
+  const snap = document.getElementById('kpiSnap');
+  if (snap) {
+    const s = d.sales || {};
+    const dev = d.quality_deviation || {};
+    const ar = d.finance_ar || {};
+    snap.innerHTML = `
+      ${miniStat('수주 건수', s.total_orders)}
+      ${miniStat('수주 미결', s.open_orders)}
+      ${miniStat('일탈 총', dev.total_deviations)}
+      ${miniStat('일탈 미결', dev.open_dev, dev.open_dev > 0)}
+      ${miniStat('Critical 일탈', dev.critical, dev.critical > 0)}
+      ${miniStat('AR 미수금', ar.ar_open ? '₩'+fmt(ar.ar_open) : 0)}
+    `;
+  }
+
+  // 일탈 모니터
+  const devMon = document.getElementById('devMonitor');
+  if (devMon) {
+    devMon.innerHTML = (d.recent_deviations || []).map(dv =>
+      `<div class="monitor-bar ${(dv.severity||'').toLowerCase()}">
+        <span class="tag tag-${(dv.severity||'minor').toLowerCase()}">${dv.severity||'N/A'}</span>
+        <span class="m-title">${dv.title||'-'}</span>
+        <span class="tag ${dv.status === 'OPEN' ? 'tag-open' : 'tag-closed'}">${dv.status}</span>
+        <span class="m-time">${(dv.detected_date||'').substring(0,10)}</span>
+      </div>`
+    ).join('');
+  }
+
+  // 재무 모니터
+  const finMon = document.getElementById('finMonitor');
+  const ar = d.finance_ar || {};
+  const ap = d.finance_ap || {};
+  const rv = (d.gl_by_type || []).find(x => x.document_type === 'RV');
+  const kr = (d.gl_by_type || []).find(x => x.document_type === 'KR');
+  if (finMon) {
+    finMon.innerHTML = `
+      ${miniStat('매출전표(RV) 차변', rv ? '₩'+fmt(rv.total_debit) : 0)}
+      ${miniStat('매입전표(KR) 차변', kr ? '₩'+fmt(kr.total_debit) : 0)}
+      ${miniStat('AR 미수금', ar.ar_open ? '₩'+fmt(ar.ar_open) : 0, (ar.ar_open||0) > 5000000)}
+      ${miniStat('AP 미결', ap.ap_open ? '₩'+fmt(ap.ap_open) : 0)}
+      ${miniStat('발생전표(accrual)', d.finance_ar ? '-' : '-')}
+    `;
+  }
+
+  // 알림 피드 (새 데이터 있을 때만)
+  const feed = document.getElementById('alertFeed');
+  if (feed && eventCount % 3 === 1) {
+    const dev = d.quality_deviation || {};
+    const items = [];
+    if (dev.critical > 0) items.push({icon:'🔴', title:'Critical 일탈 감지', desc:`${dev.critical}건 Critical 일탈 보고서 미결`, ts: new Date().toLocaleTimeString('ko-KR')});
+    if ((d.quality_oos||{}).open_oos > 0) items.push({icon:'🟡', title:'OOS 미결 건 존재', desc:`${(d.quality_oos||{}).open_oos}건 규격 이탈 미결`, ts: new Date().toLocaleTimeString('ko-KR')});
+    if ((d.quality_capa||{}).overdue_capa > 0) items.push({icon:'🟠', title:'CAPA 과기 알림', desc:`${(d.quality_capa||{}).overdue_capa}건 기한 초과`, ts: new Date().toLocaleTimeString('ko-KR')});
+    items.push({icon:'🟢', title:'DB 동기화 완료', desc:`전체 KPI 갱신 (${d.timestamp ? d.timestamp.substring(11,19) : ''})`, ts: new Date().toLocaleTimeString('ko-KR')});
+
+    const newItems = items.map(it =>
+      `<div class="alert-item"><div class="alert-icon">${it.icon}</div><div class="alert-text"><div class="title">${it.title}</div><div class="desc">${it.desc}</div></div><div class="alert-time">${it.ts}</div></div>`
+    ).join('');
+    feed.insertAdjacentHTML('afterbegin', newItems);
+    // 최대 20개 유지
+    while (feed.children.length > 20) feed.removeChild(feed.lastChild);
+  }
+}
+
+// ──────────────────────────────────────────
+// Chart 렌더링
+// ──────────────────────────────────────────
+function renderCharts(d) {
+  // 청구 추이
+  const bt = d.billing_trend || [];
+  destroyChart('billingChart');
+  const btCtx = document.getElementById('billingChart');
+  if (btCtx && bt.length) {
+    charts['billingChart'] = new Chart(btCtx, {
+      type: 'bar',
+      data: {
+        labels: bt.map(x => x.date ? x.date.substring(5) : ''),
+        datasets: [{
+          label: '일별 매출',
+          data: bt.map(x => x.daily_revenue || 0),
+          backgroundColor: 'rgba(88,166,255,.5)',
+          borderColor: '#58a6ff',
+          borderWidth: 1,
+          borderRadius: 4,
+        }]
+      },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+    });
+  }
+
+  // GL 전표 유형별
+  const gl = d.gl_by_type || [];
+  destroyChart('glTypeChart');
+  const glCtx = document.getElementById('glTypeChart');
+  if (glCtx && gl.length) {
+    const typeLabel = { RV:'매출(RV)', KR:'매입(KR)', SA:'일반(SA)', AF:'감가(AF)', WA:'출고(WA)' };
+    charts['glTypeChart'] = new Chart(glCtx, {
+      type: 'doughnut',
+      data: {
+        labels: gl.map(x => typeLabel[x.document_type] || x.document_type),
+        datasets: [{ data: gl.map(x => x.total_debit), backgroundColor: ['#58a6ff','#3fb950','#d29922','#f85149','#bc8cff'], borderWidth: 2, borderColor: '#161b22' }]
+      },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right', labels: { boxWidth: 12, padding: 8 } } } }
+    });
+  }
+
+  // 영업 - 매출 차트 (같은 데이터 재사용)
+  destroyChart('salesChart2');
+  const sc2 = document.getElementById('salesChart2');
+  if (sc2 && bt.length) {
+    charts['salesChart2'] = new Chart(sc2, {
+      type: 'line',
+      data: {
+        labels: bt.map(x => x.date ? x.date.substring(5) : ''),
+        datasets: [{
+          label: '매출액',
+          data: bt.map(x => x.daily_revenue || 0),
+          borderColor: '#3fb950',
+          backgroundColor: 'rgba(63,185,80,.1)',
+          fill: true, tension: 0.4, pointRadius: 4,
+        }]
+      },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+    });
+  }
+
+  // AR/AP 차트
+  destroyChart('arApChart');
+  const aaCtx = document.getElementById('arApChart');
+  const ar = d.finance_ar || {};
+  const ap = d.finance_ap || {};
+  if (aaCtx) {
+    charts['arApChart'] = new Chart(aaCtx, {
+      type: 'bar',
+      data: {
+        labels: ['AR 미수', 'AR 결제됨', 'AP 미결', 'AP 총액'],
+        datasets: [{
+          data: [ar.ar_open||0, ar.ar_cleared||0, ap.ap_open||0, ap.ap_total||0],
+          backgroundColor: ['#f85149','#3fb950','#d29922','#58a6ff'],
+          borderRadius: 4,
+        }]
+      },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, indexAxis: 'y' }
+    });
+  }
+
+  // 일탈 심각도
+  destroyChart('devSevChart');
+  const dsCtx = document.getElementById('devSevChart');
+  const dq = d.quality_deviation || {};
+  if (dsCtx) {
+    charts['devSevChart'] = new Chart(dsCtx, {
+      type: 'pie',
+      data: {
+        labels: ['Critical','Major','Minor'],
+        datasets: [{ data: [dq.critical||0, dq.major||0, dq.minor||0], backgroundColor: ['#f85149','#e3b341','#58a6ff'], borderWidth: 2, borderColor: '#161b22' }]
+      },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right', labels: { boxWidth: 12 } } } }
+    });
+  }
+
+  // 생산 유형
+  destroyChart('prodTypeChart');
+  const ptCtx = document.getElementById('prodTypeChart');
+  const pt = d.production_by_type || [];
+  if (ptCtx && pt.length) {
+    charts['prodTypeChart'] = new Chart(ptCtx, {
+      type: 'bar',
+      data: {
+        labels: pt.map(x => x.order_type),
+        datasets: [
+          { label: '계획 수량', data: pt.map(x => x.planned||0), backgroundColor: 'rgba(88,166,255,.5)', borderRadius: 4 },
+          { label: '확인 수량', data: pt.map(x => x.confirmed||0), backgroundColor: 'rgba(63,185,80,.5)', borderRadius: 4 },
+        ]
+      },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'top', labels: { boxWidth: 12 } } } }
+    });
+  }
+}
+
+function destroyChart(id) {
+  if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+}
+
+// ──────────────────────────────────────────
+// 유틸
+// ──────────────────────────────────────────
+function setText(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+function setBadge(id, isAlert, label, alertClass, okClass) {
+  const el = document.getElementById(id);
+  if (el) { el.textContent = label; el.className = 'badge ' + (isAlert ? alertClass : okClass); }
+}
+function renderDevTable(tbodyId, rows, limit) {
+  const tbody = document.getElementById(tbodyId);
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  rows.slice(0, limit).forEach(r => {
+    const tr = tbody.insertRow();
+    const sev = (r.severity||'MINOR').toLowerCase();
+    const sts = (r.status||'OPEN').toLowerCase();
+    tr.innerHTML = `
+      <td>${r.deviation_id||'-'}</td>
+      <td>${r.title||'-'}</td>
+      <td><span class="tag tag-${sev}">${r.severity||'-'}</span></td>
+      <td><span class="tag ${r.status==='OPEN'?'tag-open':'tag-closed'}">${r.status||'-'}</span></td>
+      <td>${(r.detected_date||'').substring(0,10)}</td>`;
+  });
+}
+function renderJvTable(tbodyId, rows, limit) {
+  const tbody = document.getElementById(tbodyId);
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  rows.slice(0, limit).forEach(r => {
+    const tr = tbody.insertRow();
+    const typeLabel = { RV:'매출', KR:'매입', SA:'일반', AF:'감가', WA:'출고', DZ:'수금' };
+    tr.innerHTML = `
+      <td>${r.document_number||'-'}</td>
+      <td><span class="tag tag-inprog">${typeLabel[r.document_type]||r.document_type||'-'}</span></td>
+      <td>${(r.posting_date||'').substring(0,10)}</td>
+      <td>${fmtKRW(r.total_debit)}</td>`;
+  });
+}
+function renderLotTable(tbodyId, rows) {
+  const tbody = document.getElementById(tbodyId);
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  rows.forEach(r => {
+    const tr = tbody.insertRow();
+    tr.innerHTML = `<td>${r.lot_id||'-'}</td><td>${r.material_id||'-'}</td><td>${r.plant_id||'-'}</td><td><span class="tag tag-inprog">${r.lot_status||'-'}</span></td><td>${(r.planned_start||'').substring(0,10)}</td>`;
+  });
+}
+function gauge(label, pct, color) {
+  return `<div class="gauge-row">
+    <span class="gauge-label">${label}</span>
+    <div class="gauge-bar"><div class="gauge-fill" style="width:${pct}%;background:${color}"></div></div>
+    <span class="gauge-val" style="color:${color}">${pct}%</span>
+  </div>`;
+}
+function miniStat(label, val, isAlert) {
+  return `<div class="mini-stat">
+    <span class="ms-label">${label}</span>
+    <span class="ms-val" style="${isAlert?'color:var(--red)':''}">${val ?? 0}</span>
+  </div>`;
+}
+
+// ──────────────────────────────────────────
+// KG 패널 데이터 로딩
+// ──────────────────────────────────────────
+let _kgLoaded = {ontology:false, kgraph:false, neo4j:false, vectorrag:false};
+let _visNetwork = null;
+let _vrDistChart = null;
+let _vrCypherText = '';
+
+function showPanel(name, tab) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+  if (tab) tab.classList.add('active');
+  if (kpiData) renderCharts(kpiData);
+  // KG 패널 지연 로딩
+  if (name === 'ontology' && !_kgLoaded.ontology) { loadOntology(); _kgLoaded.ontology=true; }
+  if (name === 'kgraph'   && !_kgLoaded.kgraph)   { loadKGraph();   _kgLoaded.kgraph=true;   }
+  if (name === 'neo4j'    && !_kgLoaded.neo4j)    { loadNeo4j();    _kgLoaded.neo4j=true;    }
+  if (name === 'vectorrag'&& !_kgLoaded.vectorrag) { loadVectorRAG();_kgLoaded.vectorrag=true;}
+}
+
+// ── OWL 온톨로지 ──
+async function loadOntology() {
+  const r = await fetch('/api/ontology');
+  const d = await r.json();
+  setText('onto-cls', d.class_count);
+  setText('onto-op',  d.obj_prop_count);
+  setText('onto-dp',  d.data_prop_count);
+
+  // 클래스 알약
+  const clsWrap = document.getElementById('onto-classes');
+  const catColor = {Material:'material', Sales:'sales', Production:'production',
+    Deviation:'quality', Oos:'quality', Product:'quality', Capa:'quality', Change:'quality', Inspection:'quality',
+    Gl:'finance', Accounts:'finance', Accrual:'finance', Cost:'finance',
+    Employee:'hr', Department:'hr', Leave:'hr', Plant:'finance', Company:'finance'};
+  (d.classes||[]).forEach(c => {
+    const cat = Object.keys(catColor).find(k => c.uri.startsWith(k)) || '';
+    const div = document.createElement('span');
+    div.className = 'pill ' + (catColor[cat]||'');
+    div.textContent = c.uri;
+    div.title = c.label;
+    clsWrap.appendChild(div);
+  });
+
+  // 객체 속성
+  const opWrap = document.getElementById('onto-obj-props');
+  (d.object_properties||[]).forEach(p => {
+    const div = document.createElement('div');
+    div.className = 'onto-prop-row';
+    div.textContent = p.uri;
+    div.title = p.label;
+    opWrap.appendChild(div);
+  });
+
+  // Turtle 스니펫
+  document.getElementById('onto-turtle').textContent = d.turtle_snippet || '';
+
+  // 데이터 속성 테이블
+  const dpBody = document.getElementById('onto-data-props');
+  (d.data_properties||[]).forEach((p, i) => {
+    const tr = dpBody.insertRow();
+    tr.innerHTML = `<td><code>${p.uri}</code></td><td><span class="tag tag-inprog">CKD class</span></td><td>${p.label}</td>`;
+  });
+}
+
+// ── 지식 그래프 (NetworkX → vis.js) ──
+async function loadKGraph() {
+  const r = await fetch('/api/kg/graph');
+  const d = await r.json();
+  const vis_data = d.vis;
+  const metrics  = d.metrics;
+
+  // KPI
+  setText('kg-nodes',   metrics.node_count);
+  setText('kg-edges',   metrics.edge_count);
+  setText('kg-density', metrics.density);
+  setText('kg-wcc',     metrics.weakly_connected_components);
+
+  // vis.js 네트워크
+  const container = document.getElementById('kg-canvas');
+  const options = {
+    nodes: { size: 14, font: { color: '#c9d1d9', size: 11 }, borderWidth: 1 },
+    edges: { arrows: { to: { enabled: true, scaleFactor: 0.5 } }, font: { color: '#8b949e', size: 9 }, smooth: { type: 'cubicBezier' } },
+    physics: { stabilization: { iterations: 80 }, barnesHut: { gravitationalConstant: -3000, springLength: 120 } },
+    interaction: { hover: true, navigationButtons: true, keyboard: true, tooltipDelay: 200 },
+    layout: { improvedLayout: true },
+  };
+  if (typeof vis !== 'undefined') {
+    const ds = new vis.DataSet(vis_data.nodes);
+    const de = new vis.DataSet(vis_data.edges);
+    _visNetwork = new vis.Network(container, { nodes: ds, edges: de }, options);
+  } else {
+    container.innerHTML = '<div style="padding:20px;color:var(--text-dim)">vis.js 로딩 중...</div>';
+    setTimeout(loadKGraph, 2000);
+    return;
+  }
+
+  // 범례
+  const legendColors = {
+    '자재(Material)':'#58a6ff','수주(SalesOrder)':'#3fb950','생산(ProdOrder)':'#bc8cff',
+    '일탈(Deviation)':'#f85149','CAPA':'#ffa657','청구(Billing)':'#26a641',
+    '세금계산서':'#39d353','GL전표':'#56d364','GL계정':'#7ee787','검사로트':'#ff7b72',
+    '구매오더':'#d2a8ff','AR채권':'#1f6feb','코스트센터':'#cae8ff',
+  };
+  const lg = document.getElementById('kg-legend');
+  Object.entries(legendColors).forEach(([label, color]) => {
+    lg.innerHTML += `<div class="legend-item"><div class="legend-dot" style="background:${color}"></div><span style="font-size:10px">${label}</span></div>`;
+  });
+
+  // 노드 타입별 분포
+  const typeDiv = document.getElementById('kg-type-dist');
+  Object.entries(metrics.type_counts||{}).sort((a,b)=>b[1]-a[1]).forEach(([t,c]) => {
+    typeDiv.innerHTML += miniStat(t, c);
+  });
+
+  // PageRank 상위
+  const prDiv = document.getElementById('kg-pagerank');
+  (metrics.top_pagerank_nodes||[]).slice(0,7).forEach((n,i) => {
+    prDiv.innerHTML += `<div class="mini-stat"><span class="ms-label">${i+1}. ${n.label}</span><span class="ms-val" style="font-size:10px">PR ${n.pagerank.toFixed(5)}</span></div>`;
+  });
+
+  // 관계 타입 알약
+  const relDiv = document.getElementById('kg-rel-counts');
+  Object.entries(metrics.rel_counts||{}).forEach(([rel, cnt]) => {
+    relDiv.innerHTML += `<span class="pill">${rel} <strong>${cnt}</strong></span>`;
+  });
+}
+
+// ── Neo4j ──
+async function loadNeo4j() {
+  const r = await fetch('/api/neo4j/preview');
+  const d = await r.json();
+
+  const statusEl = document.getElementById('neo4j-status-val');
+  statusEl.textContent = d.neo4j_connected ? '● 연결됨' : '○ 오프라인';
+  statusEl.className = d.neo4j_connected ? 'neo4j-connected' : 'neo4j-offline';
+  setText('neo4j-uri', d.neo4j_uri);
+  setText('neo4j-lines', d.script_lines);
+  setText('neo4j-nodes', d.node_statements);
+  setText('neo4j-rels',  d.relationship_statements);
+
+  // 인덱스 제약
+  document.getElementById('neo4j-constraints').textContent = (d.sample_queries||[]).map(q=>
+    `// ${q.title}\n${q.cypher}`
+  ).join('\n\n');
+
+  // 스크립트 미리보기
+  _vrCypherText = d.script_preview || '';
+  document.getElementById('neo4j-script').textContent = _vrCypherText;
+
+  // 샘플 쿼리 카드
+  const qDiv = document.getElementById('neo4j-queries');
+  (d.sample_queries||[]).forEach(q => {
+    qDiv.innerHTML += `<div class="monitor-bar" style="flex-direction:column;align-items:flex-start;margin-bottom:6px;">
+      <div style="font-weight:700;font-size:11px;color:var(--accent);margin-bottom:4px;">${q.title}</div>
+      <code style="font-size:10px;color:#79c0ff;background:var(--bg);padding:4px 8px;border-radius:4px;width:100%;">${q.cypher}</code>
+    </div>`;
+  });
+}
+
+function downloadCypher() {
+  fetch('/api/neo4j/cypher')
+    .then(r => r.text())
+    .then(txt => {
+      const blob = new Blob([txt], {type:'text/plain'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'ckd_next_neo4j.cypher';
+      a.click();
+    });
+}
+
+// ── Vector RAG ──
+async function loadVectorRAG() {
+  const statsR = await fetch('/api/vectorrag/stats');
+  const stats = await statsR.json();
+  setText('vr-docs',  stats.total_documents);
+  setText('vr-vocab', stats.vocabulary_size);
+  setText('vr-shape', stats.matrix_shape ? stats.matrix_shape.join(' × ') : '-');
+
+  // 분포 차트
+  destroyChart('vrDistChart');
+  const ctx = document.getElementById('vrDistChart');
+  const dist = stats.entity_type_distribution || {};
+  if (ctx && Object.keys(dist).length) {
+    charts['vrDistChart'] = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: Object.keys(dist),
+        datasets: [{ data: Object.values(dist), backgroundColor: '#58a6ff88', borderColor: '#58a6ff', borderRadius: 4 }]
+      },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, indexAxis: 'y' }
+    });
+  }
+
+  // 초기 검색
+  runVectorSearch();
+}
+
+async function runVectorSearch() {
+  const q = document.getElementById('vr-query').value;
+  const r = await fetch(`/api/vectorrag/search?q=${encodeURIComponent(q)}&top_k=8`);
+  const d = await r.json();
+  const resDiv = document.getElementById('vr-results');
+  resDiv.innerHTML = '';
+  (d.results||[]).forEach(item => {
+    resDiv.innerHTML += `<div class="vec-result">
+      <span class="vec-score">cosine: ${item.score}</span>
+      <div class="vec-type">${item.entity_type} | ${item.doc_id}</div>
+      <div class="vec-text">${item.text}</div>
+    </div>`;
+  });
+}
+
+function vrQuickSearch(q) {
+  document.getElementById('vr-query').value = q;
+  runVectorSearch();
+}
+
+// ── GraphRAG ──
+async function runGraphRAG() {
+  const q = document.getElementById('gr-query').value;
+  document.getElementById('gr-results-wrap').style.display = 'none';
+  document.getElementById('gr-stats-row').style.display = 'none';
+  document.getElementById('gr-fused').innerHTML = '<div style="color:var(--text-dim);padding:10px;">검색 중...</div>';
+
+  const r = await fetch(`/api/graphrag/query?q=${encodeURIComponent(q)}&top_k=10`);
+  const d = await r.json();
+
+  // 통계
+  document.getElementById('gr-stats-row').style.display = 'grid';
+  setText('gr-domain', d.domain);
+  setText('gr-v-hits', d.stats?.vector_hits || 0);
+  setText('gr-g-hits', d.stats?.graph_hits || 0);
+
+  // 융합 결과
+  const fusedDiv = document.getElementById('gr-fused');
+  fusedDiv.innerHTML = '';
+  (d.fused_results||[]).forEach(item => {
+    const srcClass = item.source === 'vector+graph' ? 'src-both' : (item.source === 'vector' ? 'src-vector' : 'src-graph');
+    fusedDiv.innerHTML += `<div class="fused-item">
+      <div class="fused-rank" style="background:var(--accent);color:#000">${item.rank}</div>
+      <div style="flex:1">
+        <div style="font-weight:600;font-size:12px">${item.doc_id}</div>
+        <div style="color:var(--text-dim);font-size:10px">${item.text||''}</div>
+      </div>
+      <span class="source-badge ${srcClass}">${item.source||''}</span>
+      <span style="color:var(--text-dim);font-size:10px">${item.rrf_score||''}</span>
+    </div>`;
+  });
+
+  // Graph 이웃
+  const gDiv = document.getElementById('gr-graph-hits');
+  gDiv.innerHTML = '';
+  (d.graph_neighbors||[]).forEach(n => {
+    gDiv.innerHTML += `<div class="monitor-bar">
+      <span class="tag tag-inprog">${n.type}</span>
+      <span class="m-title">${n.label}</span>
+      <span class="m-time">hop:${n.hop}</span>
+    </div>`;
+  });
+
+  // RAG Prompt
+  document.getElementById('gr-prompt').textContent = d.rag_prompt || '';
+
+  document.getElementById('gr-results-wrap').style.display = 'grid';
+}
+
+function grQuick(q) {
+  document.getElementById('gr-query').value = q;
+  runGraphRAG();
+}
+
+// ──────────────────────────────────────────
+// 초기화
+// ──────────────────────────────────────────
+window.onload = () => {
+  connectWS();
+};
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8765, reload=False, log_level="info")
