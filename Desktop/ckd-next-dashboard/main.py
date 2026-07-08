@@ -424,7 +424,7 @@ DASHBOARD_HTML = r"""
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
   .card-title { font-size: 13px; font-weight: 600; color: #fff; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
   .card-title .icon { font-size: 16px; }
-  canvas { max-height: 220px; }
+  canvas { max-height: none; }
 
   /* ── Table ── */
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -487,8 +487,10 @@ DASHBOARD_HTML = r"""
   .pill.hr        { border-color: #e3b341; color: #e3b341; }
 
   /* ── KG 그래프 캔버스 ── */
-  #kg-canvas-wrap { width: 100%; height: 1040px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; position: relative; }
+  #kg-canvas-wrap { width: 100%; height: 1000px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; position: relative; }
   #kg-canvas { width: 100%; height: 100%; }
+  .vis-graph-wrap { width: 100%; height: 1000px; background: var(--bg); border-radius: 8px; overflow: hidden; border: 1px solid var(--border); margin-top: 8px; }
+  .vis-graph-wrap canvas { width: 100% !important; height: 100% !important; }
   #kg-legend { position: absolute; top: 12px; right: 12px; background: rgba(13,17,23,.9); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; font-size: 11px; max-height: 240px; overflow-y: auto; }
   .legend-item { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
   .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
@@ -895,6 +897,10 @@ DASHBOARD_HTML = r"""
       </div>
     </div>
     <div class="card">
+      <div class="card-title"><span class="icon">🧬</span>OWL 클래스 관계 그래프 (ObjectProperty 기반)</div>
+      <div class="vis-graph-wrap" id="onto-canvas"></div>
+    </div>
+    <div class="card">
       <div class="card-title"><span class="icon">📄</span>Turtle 직렬화 (OWL 스니펫)</div>
       <div class="turtle-box" id="onto-turtle">로딩 중...</div>
     </div>
@@ -962,6 +968,10 @@ DASHBOARD_HTML = r"""
       </div>
     </div>
     <div class="card">
+      <div class="card-title"><span class="icon">🗄️</span>Neo4j 그래프 미리보기 (KG 데이터 → Neo4j 스타일)</div>
+      <div class="vis-graph-wrap" id="neo4j-canvas"></div>
+    </div>
+    <div class="card">
       <div class="card-title"><span class="icon">📝</span>생성된 Cypher 스크립트 미리보기 <button onclick="downloadCypher()" style="float:right;background:var(--accent);border:none;border-radius:6px;padding:4px 12px;color:#000;font-weight:700;cursor:pointer;font-size:11px;">⬇ 다운로드</button></div>
       <div class="cypher-box" id="neo4j-script">로딩 중...</div>
     </div>
@@ -1001,6 +1011,10 @@ DASHBOARD_HTML = r"""
         <button class="rag-btn" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);" onclick="vrQuickSearch('Acetaminophen Atorvastatin 자재')">자재 검색</button>
         <button class="rag-btn" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);" onclick="vrQuickSearch('감가상각 전표 비용')">회계 전표</button>
       </div>
+    </div>
+    <div class="card">
+      <div class="card-title"><span class="icon">🔍</span>벡터 유사도 네트워크 (검색 결과 그래프)</div>
+      <div class="vis-graph-wrap" id="vr-canvas"></div>
     </div>
   </div>
 
@@ -1044,6 +1058,10 @@ DASHBOARD_HTML = r"""
           <div class="prompt-box" id="gr-prompt">-</div>
         </div>
       </div>
+    </div>
+    <div class="card" id="gr-graph-wrap" style="display:none;">
+      <div class="card-title"><span class="icon">🤖</span>GraphRAG 융합 결과 네트워크 (Vector + Graph BFS)</div>
+      <div class="vis-graph-wrap" id="gr-canvas"></div>
     </div>
   </div>
 
@@ -1555,6 +1573,82 @@ async function loadOntology() {
   setText('onto-op',  d.obj_prop_count);
   setText('onto-dp',  d.data_prop_count);
 
+  // ── 온톨로지 vis.js 그래프 ──
+  const OWL_OBJ_PROPS = [
+    ["contains","SalesOrder","Material"],["bills","BillingDocument","SalesOrder"],
+    ["invoices","Invoice","BillingDocument"],["produces","ProductionOrder","Material"],
+    ["hasDeviation","ProductionOrder","DeviationReport"],["hasCapa","DeviationReport","CapaAction"],
+    ["hasOOS","InspectionLot","OOS"],["inspects","InspectionLot","Material"],
+    ["placedBy","SalesOrder","Customer"],["suppliedBy","PurchaseOrder","Vendor"],
+    ["postedTo","GlPosting","GlAccount"],["belongsToCostCenter","GlPosting","CostCenter"],
+    ["receivableFor","AccountsReceivable","Invoice"],["payableFor","AccountsPayable","PurchaseOrder"],
+    ["employedBy","Employee","Department"],["locatedAt","ProductionOrder","Plant"],
+    ["managedBy","CapaAction","Employee"],["hasBatch","ProductionOrder","Batch"],
+    ["usedIn","Material","BOM"],["changeControlFor","ChangeControl","Material"],
+  ];
+  const GROUP_COLORS = {
+    Material:'#58a6ff', RawMaterial:'#388bfd', PackagingMaterial:'#1f6feb', FinishedGood:'#79c0ff',
+    Customer:'#3fb950', SalesOrder:'#2ea043', SalesOrderItem:'#238636', BillingDocument:'#26a641', Invoice:'#39d353',
+    Vendor:'#d2a8ff', PurchaseOrder:'#bc8cff', GoodsReceipt:'#a371f7',
+    ProductionOrder:'#ffa657', Batch:'#e3b341', BOM:'#bb8009', Routing:'#9e6a03',
+    DeviationReport:'#f85149', OOS:'#ff7b72', ProductComplaint:'#ffa198', CapaAction:'#ff6e40',
+    ChangeControl:'#d29922', InspectionLot:'#b7950b', QmCharacteristic:'#e3b341',
+    GlAccount:'#7ee787', GlPosting:'#56d364', CostCenter:'#3fb950',
+    AccountsReceivable:'#1f6feb', AccountsPayable:'#388bfd', AccrualEntry:'#79c0ff',
+    Employee:'#f0883e', Department:'#e3b341', LeaveRequest:'#bb8009',
+    Plant:'#8b949e', Company:'#6e7681', ControllingArea:'#484f58',
+  };
+  // 연결된 노드만 표시 (고립 노드 제외)
+  const connectedIds = new Set(OWL_OBJ_PROPS.flatMap(([, s, t]) => [s, t]));
+  const owlNodes = new vis.DataSet((d.classes||[])
+    .filter(c => connectedIds.has(c.uri))
+    .map(c => ({
+      id: c.uri, label: c.uri, title: c.label || c.uri,
+      color: { background: GROUP_COLORS[c.uri]||'#8b949e', border: '#ffffff66',
+               highlight: { background: GROUP_COLORS[c.uri]||'#8b949e', border:'#fff' } },
+      font: { color: '#ffffff', size: 14, bold: true, strokeWidth: 3, strokeColor: '#00000099' },
+      shape: 'box', borderWidth: 2, shadow: true, margin: 8,
+    })));
+  const owlEdges = new vis.DataSet(OWL_OBJ_PROPS.map(([rel, src, tgt], i) => ({
+    id: i, from: src, to: tgt, label: rel,
+    arrows: { to: { enabled: true, scaleFactor: 0.8 } },
+    color: { color: '#58a6ff88', highlight: '#58a6ff' },
+    font: { color: '#e6edf3', size: 11, align: 'middle', strokeWidth: 2, strokeColor: '#0d1117' },
+    smooth: { type: 'curvedCW', roundness: 0.2 }, width: 2,
+  })));
+  const ontoContainer = document.getElementById('onto-canvas');
+  // 패널 레이아웃이 완전히 완료된 후 vis.js 초기화 (0높이 버그 방지)
+  await new Promise(r => setTimeout(r, 150));
+  const ontoNet = new vis.Network(ontoContainer, { nodes: owlNodes, edges: owlEdges }, {
+    layout: {
+      hierarchical: {
+        enabled: true, direction: 'UD', sortMethod: 'hubsize',
+        levelSeparation: 110, nodeSpacing: 90, treeSpacing: 180, blockShifting: true, edgeMinimization: true,
+      }
+    },
+    physics: { enabled: false },
+    interaction: { hover: true, navigationButtons: true, keyboard: true, zoomView: true },
+    nodes: { borderWidth: 2, borderWidthSelected: 3 },
+    edges: { width: 2 },
+  });
+  window._ontoNet = ontoNet;
+  // setSize로 컨테이너 크기 동기화 후 moveTo
+  setTimeout(() => {
+    const c = document.getElementById('onto-canvas');
+    ontoNet.setSize(c.offsetWidth + 'px', c.offsetHeight + 'px');
+    ontoNet.redraw();
+    const pos = ontoNet.getPositions();
+    const keys = Object.keys(pos);
+    if (!keys.length) return;
+    const xs = keys.map(k => pos[k].x), ys = keys.map(k => pos[k].y);
+    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+    const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+    const xRange = Math.max(...xs) - Math.min(...xs) + 60;
+    const yRange = Math.max(...ys) - Math.min(...ys) + 40;
+    const scale = Math.min((c.offsetWidth - 40) / xRange, (c.offsetHeight - 80) / yRange, 3.0);
+    ontoNet.moveTo({ position: { x: cx, y: cy }, scale, animation: false });
+  }, 500);
+
   // 클래스 알약
   const clsWrap = document.getElementById('onto-classes');
   const catColor = {Material:'material', Sales:'sales', Production:'production',
@@ -1684,6 +1778,45 @@ async function loadNeo4j() {
       <code style="font-size:10px;color:#79c0ff;background:var(--bg);padding:4px 8px;border-radius:4px;width:100%;">${q.cypher}</code>
     </div>`;
   });
+
+  // ── Neo4j 스타일 그래프 (KG 데이터 재활용, Neo4j 컬러 팔레트) ──
+  const NEO4J_COLORS = {
+    Material:'#4A90D9', SalesOrder:'#57B55D', ProductionOrder:'#D4A843',
+    DeviationReport:'#E05A4F', CapaAction:'#E8812A', BillingDocument:'#7B68EE',
+    Invoice:'#20B2AA', GlAccount:'#3CB371', GlPosting:'#228B22',
+    CostCenter:'#6B8E23', InspectionLot:'#CD853F', AccountsReceivable:'#4682B4',
+    PurchaseOrder:'#9370DB', default:'#708090',
+  };
+  const kgR = await fetch('/api/kg/graph');
+  const kgD = await kgR.json();
+  const neo4jNodes = new vis.DataSet((kgD.vis.nodes||[]).map(n => {
+    const col = NEO4J_COLORS[n.group] || NEO4J_COLORS.default;
+    return { ...n, color: { background: col, border: '#fff4', highlight: { background: col, border: '#fff' } },
+      shape: 'ellipse', size: 18,
+      font: { color: '#fff', size: 12, bold: true, strokeWidth: 2, strokeColor: '#00000088' },
+      borderWidth: 2 };
+  }));
+  const neo4jEdges = new vis.DataSet((kgD.vis.edges||[]).map(e => ({
+    ...e, color: { color: '#4A4A5A88', highlight: '#4A90D9' },
+    font: { color: '#9aa3af', size: 10, strokeWidth: 2, strokeColor: '#0d1117' },
+    arrows: { to: { scaleFactor: 0.6 } }, width: 1.5,
+  })));
+  const _neo4jC = document.getElementById('neo4j-canvas');
+  const neo4jNet = new vis.Network(_neo4jC,
+    { nodes: neo4jNodes, edges: neo4jEdges },
+    { physics: { barnesHut: { gravitationalConstant: -3000, springLength: 80, springConstant: 0.08, damping: 0.3 }, stabilization: { iterations: 150 } },
+      interaction: { hover: true, navigationButtons: true, zoomView: true },
+      nodes: { borderWidth: 2 }, edges: { smooth: { type: 'continuous' }, width: 1.5 } });
+  neo4jNet.once('stabilizationIterationsDone', () => setTimeout(() => {
+    const c = document.getElementById('neo4j-canvas');
+    neo4jNet.setSize(c.offsetWidth+'px', c.offsetHeight+'px'); neo4jNet.redraw();
+    const pos = neo4jNet.getPositions(); const keys = Object.keys(pos);
+    if (!keys.length) return;
+    const xs = keys.map(k=>pos[k].x), ys = keys.map(k=>pos[k].y);
+    const cx=(Math.min(...xs)+Math.max(...xs))/2, cy=(Math.min(...ys)+Math.max(...ys))/2;
+    const scale = Math.min((c.offsetWidth-40)/(Math.max(...xs)-Math.min(...xs)+60), (c.offsetHeight-80)/(Math.max(...ys)-Math.min(...ys)+40), 2.5);
+    neo4jNet.moveTo({ position:{x:cx,y:cy}, scale, animation:false });
+  }, 500));
 }
 
 function downloadCypher() {
@@ -1725,9 +1858,10 @@ async function loadVectorRAG() {
   runVectorSearch();
 }
 
+let _vrNetwork = null;
 async function runVectorSearch() {
   const q = document.getElementById('vr-query').value;
-  const r = await fetch(`/api/vectorrag/search?q=${encodeURIComponent(q)}&top_k=8`);
+  const r = await fetch(`/api/vectorrag/search?q=${encodeURIComponent(q)}&top_k=12`);
   const d = await r.json();
   const resDiv = document.getElementById('vr-results');
   resDiv.innerHTML = '';
@@ -1738,6 +1872,52 @@ async function runVectorSearch() {
       <div class="vec-text">${item.text}</div>
     </div>`;
   });
+
+  // ── 유사도 네트워크 그래프 ──
+  const VR_COLORS = {
+    Material:'#58a6ff', DeviationReport:'#f85149', CapaAction:'#ffa657',
+    GlPosting:'#3fb950', ProductionOrder:'#d2a8ff', SalesOrder:'#39d353',
+    ProductComplaint:'#ff7b72', ChangeControl:'#e3b341', GlAccount:'#7ee787',
+  };
+  const results = d.results || [];
+  const vrNodes = new vis.DataSet([
+    { id: '__query__', label: q.substring(0,18)+'…', shape:'diamond',
+      color: { background:'#f0883e', border:'#fff' }, size: 22,
+      font: { color:'#fff', size: 12, bold: true } },
+    ...results.map((item, i) => ({
+      id: item.doc_id, label: item.doc_id,
+      title: `[${item.entity_type}] score:${item.score}\n${item.text.substring(0,80)}`,
+      shape: 'dot', size: 14 + Math.round(item.score * 40),
+      color: { background: VR_COLORS[item.entity_type]||'#8b949e', border:'#fff4',
+               highlight: { background: VR_COLORS[item.entity_type]||'#8b949e', border:'#fff' } },
+      font: { color:'#e6edf3', size: 12, bold: true, strokeWidth: 2, strokeColor: '#0d1117' },
+    }))
+  ]);
+  const vrEdges = new vis.DataSet(results.map((item, i) => ({
+    id: i, from: '__query__', to: item.doc_id,
+    label: String(item.score),
+    width: 1 + item.score * 4,
+    color: { color: VR_COLORS[item.entity_type]+'88' || '#58a6ff44', highlight: VR_COLORS[item.entity_type]||'#58a6ff' },
+    font: { color:'#8b949e', size: 8 },
+    arrows: { to: { enabled: false } },
+    smooth: { type: 'curvedCW', roundness: 0.3 },
+  })));
+  if (_vrNetwork) _vrNetwork.destroy();
+  _vrNetwork = new vis.Network(document.getElementById('vr-canvas'),
+    { nodes: vrNodes, edges: vrEdges },
+    { physics: { barnesHut: { gravitationalConstant: -4000, springLength: 130, damping: 0.2 }, stabilization: { iterations: 100 } },
+      interaction: { hover: true, navigationButtons: true, tooltipDelay: 100, zoomView: true },
+      nodes: { borderWidth: 2 }, edges: { smooth: { type: 'curvedCW', roundness: 0.3 }, width: 2 } });
+  _vrNetwork.once('stabilizationIterationsDone', () => setTimeout(() => {
+    const c = document.getElementById('vr-canvas');
+    _vrNetwork.setSize(c.offsetWidth+'px', c.offsetHeight+'px'); _vrNetwork.redraw();
+    const pos = _vrNetwork.getPositions(); const keys = Object.keys(pos);
+    if (!keys.length) return;
+    const xs = keys.map(k=>pos[k].x), ys = keys.map(k=>pos[k].y);
+    const cx=(Math.min(...xs)+Math.max(...xs))/2, cy=(Math.min(...ys)+Math.max(...ys))/2;
+    const scale = Math.min((c.offsetWidth-40)/(Math.max(...xs)-Math.min(...xs)+60), (c.offsetHeight-80)/(Math.max(...ys)-Math.min(...ys)+60), 3.0);
+    _vrNetwork.moveTo({ position:{x:cx,y:cy}, scale, animation:false });
+  }, 500));
 }
 
 function vrQuickSearch(q) {
@@ -1792,6 +1972,67 @@ async function runGraphRAG() {
   document.getElementById('gr-prompt').textContent = d.rag_prompt || '';
 
   document.getElementById('gr-results-wrap').style.display = 'grid';
+
+  // ── GraphRAG 융합 네트워크 그래프 ──
+  const GR_SRC_COLOR = { vector:'#58a6ff', graph:'#3fb950', 'vector+graph':'#ffa657' };
+  const GR_TYPE_COLOR = {
+    Material:'#388bfd', SalesOrder:'#2ea043', ProductionOrder:'#e3b341',
+    DeviationReport:'#f85149', CapaAction:'#ff6e40', GlPosting:'#56d364',
+    GlAccount:'#7ee787', BillingDocument:'#bc8cff', InspectionLot:'#d2a8ff',
+    AccountsReceivable:'#4682B4', PurchaseOrder:'#9370DB',
+  };
+  const grNodes = new vis.DataSet();
+  const grEdges = new vis.DataSet();
+  // 쿼리 노드
+  grNodes.add({ id:'__q__', label: q.substring(0,16)+'…', shape:'star', size:28,
+    color:{background:'#f0883e',border:'#fff'}, font:{color:'#fff',size:13,bold:true} });
+  // 융합 결과 노드
+  (d.fused_results||[]).forEach((item, i) => {
+    const col = GR_SRC_COLOR[item.source] || '#8b949e';
+    if (!grNodes.get(item.doc_id)) {
+      grNodes.add({ id: item.doc_id, label: `#${item.rank} ${item.doc_id}`,
+        title: `[${item.source}] RRF:${item.rrf_score||''}\n${(item.text||'').substring(0,80)}`,
+        shape:'dot', size: 14 - i, color:{background:col,border:'#fff2',highlight:{background:col,border:'#fff'}},
+        font:{color:'#e6edf3', size:10} });
+    }
+    grEdges.add({ id:'v'+i, from:'__q__', to: item.doc_id,
+      color:{color:col+'88',highlight:col}, width:2-(i*0.1),
+      arrows:{to:{enabled:false}}, smooth:{type:'dynamic'} });
+  });
+  // 그래프 이웃 노드 추가
+  (d.graph_neighbors||[]).forEach((n, i) => {
+    const nid = 'gn:'+n.label;
+    const col = GR_TYPE_COLOR[n.type] || '#8b949e';
+    if (!grNodes.get(nid)) {
+      grNodes.add({ id:nid, label: n.label.substring(0,16),
+        title: `[${n.type}] hop:${n.hop}`, shape:'square', size:9,
+        color:{background:col+'cc',border:'#fff1',highlight:{background:col,border:'#fff'}},
+        font:{color:'#c9d1d9',size:9} });
+      // 가장 관련성 있는 융합 결과에 연결 시도
+      const relFused = (d.fused_results||[]).find(f => f.doc_id && n.label && (f.doc_id.includes(n.label) || n.label.includes(f.doc_id.replace(/\D+/,''))));
+      const linkTarget = relFused ? relFused.doc_id : '__q__';
+      grEdges.add({ id:'gn'+i, from:linkTarget, to:nid,
+        color:{color:col+'55'}, width:1, dashes:true,
+        arrows:{to:{enabled:true,scaleFactor:0.4}}, smooth:{type:'curvedCW',roundness:0.4} });
+    }
+  });
+  document.getElementById('gr-graph-wrap').style.display = 'block';
+  const grNet = new vis.Network(document.getElementById('gr-canvas'),
+    { nodes: grNodes, edges: grEdges },
+    { physics: { barnesHut:{ gravitationalConstant:-4000, springLength:160, damping:0.15 },
+        stabilization:{ iterations:120 } },
+      interaction: { hover:true, navigationButtons:true, tooltipDelay:100 },
+      nodes:{ borderWidth:1 }, edges:{ smooth:{ type:'dynamic' } } });
+  grNet.once('stabilizationIterationsDone', () => setTimeout(() => {
+    const c = document.getElementById('gr-canvas');
+    grNet.setSize(c.offsetWidth+'px', c.offsetHeight+'px'); grNet.redraw();
+    const pos = grNet.getPositions(); const keys = Object.keys(pos);
+    if (!keys.length) return;
+    const xs = keys.map(k=>pos[k].x), ys = keys.map(k=>pos[k].y);
+    const cx=(Math.min(...xs)+Math.max(...xs))/2, cy=(Math.min(...ys)+Math.max(...ys))/2;
+    const scale = Math.min((c.offsetWidth-40)/(Math.max(...xs)-Math.min(...xs)+60), (c.offsetHeight-80)/(Math.max(...ys)-Math.min(...ys)+60), 3.0);
+    grNet.moveTo({ position:{x:cx,y:cy}, scale, animation:false });
+  }, 500));
 }
 
 function grQuick(q) {
