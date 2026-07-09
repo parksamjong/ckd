@@ -448,6 +448,131 @@ requests.post("https://api.browseract.com/v2/workflow/run-task-by-template", hea
 
 ---
 
+## 15. anthropics/skills — 공식 Anthropic 스킬 컬렉션
+
+> 출처: https://github.com/anthropics/skills
+> 설치: `npx skills add anthropics/skills@<skill-name>`
+
+Anthropic 공식 제공 스킬 17종. 창작·문서·개발·엔터프라이즈 워크플로우 커버.
+
+| 스킬 | 설명 |
+|---|---|
+| `algorithmic-art` | 알고리즘 아트 생성 |
+| `brand-guidelines` | 브랜드 가이드라인 적용 |
+| `canvas-design` | Canvas 기반 디자인 |
+| `claude-api` | Claude API 코드 생성 |
+| `doc-coauthoring` | 문서 공동 저작 |
+| `docx` | Word 문서 생성/편집 |
+| `frontend-design` | 프론트엔드 UI 디자인 |
+| `internal-comms` | 사내 커뮤니케이션 |
+| `mcp-builder` | MCP 서버 생성 |
+| `pdf` | PDF 생성/처리 |
+| `pptx` | PowerPoint 생성 |
+| `skill-creator` | 새 스킬 작성 보조 |
+| `slack-gif-creator` | Slack GIF 생성 |
+| `theme-factory` | 테마/색상 팔레트 생성 |
+| `web-artifacts-builder` | 웹 아티팩트 빌더 |
+| `webapp-testing` | 웹앱 자동 테스트 |
+| `xlsx` | Excel 파일 생성/처리 |
+
+---
+
+## 16. ComposioHQ/awesome-claude-skills — 1000+ 스킬 큐레이션 컬렉션
+
+> 출처: https://github.com/ComposioHQ/awesome-claude-skills
+> 설치: `npx skills add ComposioHQ/awesome-claude-skills@<skill-name>`
+
+1000+ 실전 스킬 + **500+ 앱 연동** (이메일 발송, GitHub 이슈 생성, Slack 전송 등 실제 액션 수행).
+
+**핵심 플러그인 — connect-apps:**
+```bash
+claude --plugin-dir ./connect-apps-plugin
+/connect-apps:setup   # API 키 입력 (dashboard.composio.dev)
+```
+
+**주요 스킬 카테고리:**
+
+| 스킬 | 설명 |
+|---|---|
+| `artifacts-builder` | 웹 아티팩트 빌더 |
+| `changelog-generator` | 변경 이력 자동 생성 |
+| `competitive-ads-extractor` | 경쟁사 광고 분석 추출 |
+| `content-research-writer` | 콘텐츠 리서치·작성 |
+| `developer-growth-analysis` | 개발자 성장 분석 |
+| `domain-name-brainstormer` | 도메인명 아이디어 생성 |
+| `file-organizer` | 파일 정리 자동화 |
+| `image-enhancer` | 이미지 품질 향상 |
+| `invoice-organizer` | 인보이스 정리 |
+| `lead-research-assistant` | 리드 리서치 |
+| `meeting-insights-analyzer` | 회의록 분석 |
+| `tailored-resume-generator` | 맞춤 이력서 생성 |
+| `twitter-algorithm-optimizer` | 트위터 알고리즘 최적화 |
+| `video-downloader` | 영상 다운로드 |
+
+---
+
+## 17. JimLiu/baoyu-skills — 콘텐츠·미디어·소셜 스킬 21종
+
+> 출처: https://github.com/JimLiu/baoyu-skills
+> 설치: `npx skills add jimliu/baoyu-skills` 또는 `npx skills add jimliu/baoyu-skills@<skill-name>`
+
+AI 에이전트(Claude Code, Codex 등)로 콘텐츠 제작·SNS 배포 워크플로우를 자동화하는 21개 스킬.
+
+| 스킬 | 설명 |
+|---|---|
+| `baoyu-article-illustrator` | 기사 일러스트 자동 생성 |
+| `baoyu-comic` | 만화 생성 |
+| `baoyu-compress-image` | 이미지 압축 |
+| `baoyu-cover-image` | 커버 이미지 생성 |
+| `baoyu-diagram` | 다이어그램 생성 |
+| `baoyu-image-gen` | 이미지 생성 |
+| `baoyu-infographic` | 인포그래픽 생성 |
+| `baoyu-markdown-to-html` | Markdown → HTML 변환 |
+| `baoyu-post-to-wechat` | 위챗 공식 계정 발행 |
+| `baoyu-post-to-weibo` | 웨이보 포스팅 |
+| `baoyu-post-to-x` | X(트위터) 포스팅 |
+| `baoyu-slide-deck` | 슬라이드 덱 생성 |
+| `baoyu-translate` | 번역 |
+| `baoyu-url-to-markdown` | URL → Markdown 변환 |
+| `baoyu-wechat-summary` | 위챗 기사 요약 |
+| `baoyu-xhs-images` | 샤오홍슈 이미지 생성 |
+| `baoyu-youtube-transcript` | YouTube 자막 추출 |
+
+---
+
+## 18. stellarlinkco/myclaude — 멀티 에이전트 오케스트레이션 워크플로우
+
+> 출처: https://github.com/stellarlinkco/myclaude
+> 설치: `npx github:stellarlinkco/myclaude`
+> 지원 런타임: Claude Code · Codex · Gemini · OpenCode
+
+멀티백엔드 멀티 에이전트 개발 자동화 시스템. 6개 모듈로 구성.
+
+| 모듈 | 명령 | 설명 |
+|---|---|---|
+| `do` | `/do` | ★추천 — 5단계 피처 개발 (codeagent 오케스트레이션) |
+| `omo` | `/omo` | 인텔리전트 라우팅 멀티 에이전트 오케스트레이션 |
+| `bmad` | `/bmad-pilot` | BMAD 애자일 워크플로우 (6개 전문 에이전트) |
+| `requirements` | `/requirements-pilot` | 경량 요구사항→코드 파이프라인 |
+| `essentials` | `/code`, `/debug` 등 | 11개 핵심 개발 명령 (ask/bugfix/code/debug/docs/enhance-prompt/optimize/refactor/review/test/think) |
+| `sparv` | `/sparv` | Specify→Plan→Act→Review→Vault 워크플로우 |
+
+---
+
+## 19. WangBaoHe333/claude-code-skills-hub — 898개 스킬 검색·배치 설치 허브
+
+> 출처: https://github.com/WangBaoHe333/claude-code-skills-hub
+> 웹 UI: http://39.104.27.129/skills/
+
+위 소스들(anthropics/skills, baoyu-skills, awesome-claude-skills, myclaude)의 898개 스킬을 **한 곳에서 검색·선택·배치 다운로드**할 수 있는 집계 플랫폼.
+
+- 중문/영문 이중 언어 UI
+- 이름·용도·시나리오·태그 검색
+- 여러 스킬 선택 후 ccswitch 호환 ZIP 일괄 내보내기
+- 각 스킬 상세에 출처·원본 설명·라이선스 표시
+
+---
+
 ## AI의 3가지 고질병 — 항상 경계
 
 1. **잘못된 가정** — 코드를 읽기 전에 작동 방식을 가정하지 말 것
