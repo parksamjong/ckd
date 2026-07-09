@@ -234,6 +234,49 @@ React Artifact를 만들어줘.
 
 ---
 
+## 11. Agent Reach — AI 에이전트 인터넷 접근 능력 레이어 (Panniantong)
+
+> 출처: https://github.com/Panniantong/Agent-Reach
+> ⭐ 53k stars
+
+AI 에이전트에게 인터넷 읽기/검색 능력을 한 번에 부여하는 **능력 레이어(capability layer)**.
+Twitter, Reddit, YouTube, GitHub, Bilibili, 小红书, RSS, 일반 웹페이지를 API 비용 없이 접근 가능.
+
+### 설치
+
+에이전트에게 한 문장 전달:
+```
+帮我安装 Agent Reach：https://raw.githubusercontent.com/Panniantong/agent-reach/main/docs/install.md
+```
+
+안전 모드 (시스템 패키지 자동 설치 없이 안내만):
+```
+帮我安装 Agent Reach（安全模式）：... --safe
+```
+
+업데이트:
+```
+帮我更新 Agent Reach：https://raw.githubusercontent.com/Panniantong/agent-reach/main/docs/update.md
+```
+
+### 주요 능력
+
+| 명령 예시 | 내부 도구 |
+|---|---|
+| "이 링크 내용 봐줘" | `curl https://r.jina.ai/URL` |
+| "이 GitHub 레포 설명해줘" | `gh repo view owner/repo` |
+| "이 YouTube 영상 요약해줘" | `yt-dlp` 자막 추출 |
+| "Bilibili에서 AI 튜토리얼 찾아줘" | `bili search` (로그인 불필요) |
+| "LLM 프레임워크 비교 검색해줘" | Exa 시맨틱 검색 |
+| "이 RSS 구독해줘" | `feedparser` |
+
+### 설계 철학
+- 도구가 아닌 **능력 레이어** — 선정·설치·진단·라우팅만 담당, 실제 읽기는 상위 도구가 직접 호출
+- SKILL.md를 읽은 에이전트가 상황에 맞는 도구를 자율 선택
+- 로그인 필요 플랫폼(小红书, Twitter, Reddit 등)은 `帮我配 XXX`로 개별 설정
+
+---
+
 ## AI의 3가지 고질병 — 항상 경계
 
 1. **잘못된 가정** — 코드를 읽기 전에 작동 방식을 가정하지 말 것
