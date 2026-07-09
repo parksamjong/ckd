@@ -324,7 +324,10 @@ manager = ConnectionManager()
 
 
 async def _redis_pubsub_broadcaster():
-    """Redis Pub/Sub에서 CDC 이벤트를 수신해 WebSocket으로 브로드캐스트."""
+    """Redis Pub/Sub에서 CDC 이벤트를 수신해 WebSocket으로 브로드캐스트. 실패 시 재시작."""
+    import logging as _log
+    _logger = _log.getLogger("ckd.pubsub")
+
     async def _on_msg(data: str):
         try:
             payload = json.loads(data)
@@ -341,11 +344,16 @@ async def _redis_pubsub_broadcaster():
             })
         except Exception:
             pass
-    try:
-        await _rc.subscribe_realtime(_on_msg)
-    except Exception as e:
-        import logging
-        logging.getLogger("ckd.main").warning(f"Redis PubSub 브릿지 종료: {e}")
+
+    while True:
+        try:
+            await _rc.subscribe_realtime(_on_msg)
+        except asyncio.CancelledError:
+            _logger.info("Redis PubSub 브로드캐스터 취소됨")
+            break
+        except Exception as e:
+            _logger.warning(f"Redis PubSub 재연결 대기 (5s): {e}")
+            await asyncio.sleep(5)
 
 
 @app.websocket("/ws/monitor")

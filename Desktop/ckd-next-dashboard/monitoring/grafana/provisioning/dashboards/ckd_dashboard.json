@@ -1,5 +1,6 @@
 {
   "id": null,
+  "uid": "ckd-next-main",
   "title": "CKD-NEXT 운영 대시보드",
   "tags": ["ckd-next"],
   "timezone": "Asia/Seoul",
@@ -8,59 +9,71 @@
     {
       "id": 1, "type": "stat", "title": "CDC 이벤트 총계",
       "gridPos": {"x":0,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"sum(ckd_cdc_events_total)","legendFormat":"total"}],
-      "datasource": "Prometheus"
+      "targets": [{"expr":"sum(ckd_cdc_events_total)","legendFormat":"total","refId":"A"}],
+      "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"}
     },
     {
       "id": 2, "type": "stat", "title": "Redis Stream 메시지",
       "gridPos": {"x":4,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"ckd_redis_stream_length","legendFormat":"msgs"}],
-      "datasource": "Prometheus"
+      "targets": [{"expr":"ckd_redis_stream_length","legendFormat":"msgs","refId":"A"}],
+      "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"}
     },
     {
-      "id": 3, "type": "stat", "title": "WebSocket 클라이언트",
+      "id": 3, "type": "stat", "title": "WebSocket 연결수",
       "gridPos": {"x":8,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"ckd_websocket_connections","legendFormat":"clients"}],
-      "datasource": "Prometheus"
+      "targets": [{"expr":"ckd_websocket_connections","legendFormat":"clients","refId":"A"}],
+      "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"}
     },
     {
       "id": 4, "type": "stat", "title": "Critical 일탈",
       "gridPos": {"x":12,"y":0,"w":4,"h":4},
-      "targets": [{"expr":"ckd_kpi_critical_deviations","legendFormat":"critical"}],
-      "datasource": "Prometheus",
+      "targets": [{"expr":"ckd_kpi_critical_deviations","legendFormat":"critical","refId":"A"}],
+      "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"},
       "options": {"thresholds": {"steps": [{"color":"green","value":0},{"color":"red","value":1}]}}
     },
     {
-      "id": 5, "type": "timeseries", "title": "CDC 이벤트 테이블별 rate (1m)",
-      "gridPos": {"x":0,"y":4,"w":12,"h":8},
-      "targets": [{"expr":"rate(ckd_cdc_events_total[1m])","legendFormat":"{{table_name}}/{{operation}}"}],
-      "datasource": "Prometheus"
+      "id": 5, "type": "stat", "title": "수주 총계",
+      "gridPos": {"x":16,"y":0,"w":4,"h":4},
+      "targets": [{"expr":"ckd_kpi_sales_orders","legendFormat":"orders","refId":"A"}],
+      "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"}
     },
     {
-      "id": 6, "type": "timeseries", "title": "Redis Stream / 수주 / 일탈 추이",
+      "id": 6, "type": "stat", "title": "AR 미수금 (KRW)",
+      "gridPos": {"x":20,"y":0,"w":4,"h":4},
+      "targets": [{"expr":"ckd_kpi_ar_open_krw","legendFormat":"AR","refId":"A"}],
+      "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"}
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "CDC 이벤트 rate (1m)",
+      "gridPos": {"x":0,"y":4,"w":12,"h":8},
+      "targets": [{"expr":"sum by(table_name,operation)(rate(ckd_cdc_events_total[1m]))","legendFormat":"{{table_name}}/{{operation}}","refId":"A"}],
+      "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"}
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Redis Stream / 수주 / 일탈 추이",
       "gridPos": {"x":12,"y":4,"w":12,"h":8},
       "targets": [
-        {"expr":"ckd_redis_stream_length","legendFormat":"Redis Stream"},
-        {"expr":"ckd_kpi_sales_orders","legendFormat":"수주"},
-        {"expr":"ckd_kpi_deviations","legendFormat":"일탈"}
+        {"expr":"ckd_redis_stream_length","legendFormat":"Redis Stream","refId":"A"},
+        {"expr":"ckd_kpi_sales_orders","legendFormat":"수주","refId":"B"},
+        {"expr":"ckd_kpi_deviations","legendFormat":"일탈","refId":"C"}
       ],
-      "datasource": "Prometheus"
+      "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"}
     },
     {
-      "id": 7, "type": "timeseries", "title": "AR 미수금 (KRW)",
+      "id": 9, "type": "timeseries", "title": "AR 미수금 추이 (KRW)",
       "gridPos": {"x":0,"y":12,"w":12,"h":6},
-      "targets": [{"expr":"ckd_kpi_ar_open_krw","legendFormat":"AR 미수금"}],
-      "datasource": "Prometheus"
+      "targets": [{"expr":"ckd_kpi_ar_open_krw","legendFormat":"AR 미수금","refId":"A"}],
+      "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"}
     },
     {
-      "id": 8, "type": "timeseries", "title": "CDC 이벤트 operation별 rate",
+      "id": 10, "type": "timeseries", "title": "CDC operation별 rate",
       "gridPos": {"x":12,"y":12,"w":12,"h":6},
       "targets": [
-        {"expr":"sum by(operation)(rate(ckd_cdc_events_total[1m]))","legendFormat":"{{operation}}"}
+        {"expr":"sum by(operation)(rate(ckd_cdc_events_total[1m]))","legendFormat":"{{operation}}","refId":"A"}
       ],
-      "datasource": "Prometheus"
+      "datasource": {"type":"prometheus","uid":"PBFA97CFB590B2093"}
     }
   ],
   "schemaVersion": 39,
-  "version": 1
+  "version": 2
 }

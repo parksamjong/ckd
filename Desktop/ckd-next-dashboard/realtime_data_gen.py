@@ -30,6 +30,7 @@ _stop = threading.Event()
 STATUSES_SO  = ["OPEN","IN_PROCESS","COMPLETED","CANCELLED"]
 STATUSES_DEV = ["OPEN","IN_INVESTIGATION","CLOSED","CANCELLED"]
 SEVERITIES   = ["MINOR","MINOR","MINOR","MAJOR","MAJOR","CRITICAL"]
+DEV_TYPES    = ["EQUIPMENT","MATERIAL","PROCESS","DOCUMENTATION","ENVIRONMENTAL"]
 CAPA_STAT    = ["OPEN","IN_PROGRESS","COMPLETED","VERIFIED"]
 PROD_STAT    = ["CRTD","REL","PCNF","TECO"]
 AR_STAT      = ["OPEN","PARTIAL","CLEARED"]
@@ -44,7 +45,7 @@ def get_conn():
 def gen_sales_order(cur):
     cid = random.randint(1, 20)
     total = round(random.uniform(1_000_000, 500_000_000), 2)
-    order_no = f"SO-{datetime.now().strftime('%Y%m%d%H%M%S')}-{random.randint(100,999)}"
+    order_no = f"SO-{datetime.now().strftime('%y%m%d%H%M%S')}"
     cur.execute("""
         INSERT INTO sales_order (order_no, customer_id, order_date, overall_status, total_net_amount)
         VALUES (%s, %s, %s, %s, %s)
@@ -67,12 +68,14 @@ def gen_deviation(cur):
     r = cur.fetchone()
     if not r: return
     sev = random.choice(SEVERITIES)
+    dev_type = random.choice(DEV_TYPES)
     dev_id = f"DEV-{datetime.now().strftime('%y%m%d%H%M%S')}"
     cur.execute("""
-        INSERT INTO deviation_report (deviation_id, material_id, severity, status, detected_date)
-        VALUES (%s, %s, %s, 'OPEN', %s)
+        INSERT INTO deviation_report
+          (deviation_id, deviation_type, material_id, severity, status, detected_date, description, created_by)
+        VALUES (%s, %s, %s, %s, 'OPEN', %s, %s, 'datagen')
         ON CONFLICT DO NOTHING
-    """, (dev_id, r["material_id"], sev, date.today()))
+    """, (dev_id, dev_type, r["material_id"], sev, date.today(), f"Auto-generated {dev_type} deviation"))
     log.info(f"일탈 INSERT {dev_id} [{sev}]")
 
 

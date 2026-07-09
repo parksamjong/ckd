@@ -183,9 +183,14 @@ async def subscribe_realtime(callback):
         async for msg in pubsub.listen():
             if msg["type"] == "message":
                 await callback(msg["data"])
+    except (asyncio.CancelledError, GeneratorExit, RuntimeError):
+        pass
     finally:
-        await pubsub.unsubscribe(PUBSUB_CH)
-        await r.aclose()
+        try:
+            await pubsub.unsubscribe(PUBSUB_CH)
+            await r.aclose()
+        except Exception:
+            pass
 
 
 # ── 헬스체크 ─────────────────────────────────────────────────────
