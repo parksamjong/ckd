@@ -2,6 +2,33 @@
 
 ---
 
+## 0. 멀티에이전트 자동 오케스트레이션 (항상 적용)
+
+**별도 명령 없이** 아래 조건에 해당하면 자동으로 orchestrator 패턴을 사용한다.
+
+### 자동 활성화 조건
+- 프론트엔드 + 백엔드를 **동시에** 수정해야 하는 작업
+- **3개 이상**의 독립적으로 실행 가능한 서브태스크가 있는 작업
+- 예상 작업 시간이 **30분 이상**인 복잡한 기능 구현
+- "전체", "모두", "리뉴얼", "추가해줘 (여러 항목)" 등의 키워드 포함
+
+### 자동 실행 절차 (명령어 불필요)
+1. **칸반보드 생성** — 서브태스크마다 `TaskCreate` 호출, 보드에서 전체 진행 추적
+2. **병렬 디스패치** — 독립 태스크는 단일 메시지에서 `Agent` 동시 호출 (`isolation: worktree`)
+3. **모니터링** — `TaskGet`으로 각 에이전트 상태 확인
+4. **통합** — 완료 후 결과 병합, 빌드/테스트 검증
+
+### 에이전트 역할 분담
+| 에이전트 | 담당 | 정의 파일 |
+|---|---|---|
+| orchestrator | 전체 지휘·통합 | `.claude/agents/orchestrator.md` |
+| backend-agent | API·서비스·DB | `.claude/agents/backend-agent.md` |
+| frontend-agent | UI·컴포넌트·라우터 | `.claude/agents/frontend-agent.md` |
+| test-agent | 테스트 작성·실행 | `.claude/agents/test-agent.md` |
+| code-reviewer | 리뷰·보안 점검 | `.claude/agents/code-reviewer.md` |
+
+---
+
 ## 1. Karpathy 코딩 원칙 (andrej-karpathy-skills)
 
 > 출처: https://github.com/multica-ai/andrej-karpathy-skills
@@ -952,6 +979,137 @@ yay -S stably-orca-bin
 # Windows / Linux: GitHub Releases에서 직접 다운로드
 # https://github.com/stablyai/orca/releases/latest
 ```
+
+---
+
+## 31. LLM Wiki 세컨드 브레인 — Karpathy × Obsidian × Graphify
+
+> 출처: https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f
+
+**"RAG는 매번 검색해서 답을 만든다. LLM Wiki는 지식이 쌓여서 답이 더 좋아진다. 개인 지식관리에는 검색이 아니라 축적이 필요하다."**
+
+개인 지식을 Obsidian 볼트에 체계적으로 모으고, Claude Code가 읽고 활용하는 AI 세컨드 브레인 워크플로우.
+
+### 필요 도구
+
+| 도구 | 역할 |
+|---|---|
+| Obsidian | 볼트 생성 (https://obsidian.md) |
+| Claude Code | 데스크탑 앱 또는 터미널, 볼트 폴더에 연결 |
+| Obsidian Web Clipper | Chrome 확장 프로그램 — 수집 자동화 |
+| Graphify | `pip install graphifyy` — 지식 그래프 시각화 |
+
+### 사전 숙제 3가지 (한 줄씩이면 충분)
+
+1. **나는 누구인가** — 이름, 하는 일, 역할
+2. **왜 기록하고 싶은가** — 지금 뭐가 안 되는지, 기록이 되면 뭐가 달라지는지
+3. **어떤 아웃풋을 만들고 싶은가** — 누구를 위해, 어떤 형태로
+
+> Gold In, Gold Out — 목적 없이 수집하면 쓰레기 데이터.
+
+### 7단계 워크플로우
+
+| 단계 | 설명 | 핵심 산출물 |
+|---|---|---|
+| Step 1 | 맥락 인터뷰 — AI가 나를 깊이 파악 | `나의 핵심 맥락.md` |
+| Step 2 | CLAUDE.md 생성 — AI가 읽는 나의 설명서 | `CLAUDE.md` (볼트 내) |
+| Step 3 | LLM Wiki 세팅 — 폴더 구조 + 위키 스키마 | `wiki/` 구조 |
+| Step 4 | 웹 클리퍼 템플릿 — 수집 자동화 | 커스텀 JSON 템플릿 |
+| Step 5 | 인제스트 — 수집한 것을 나의 지식으로 | `wiki/` 반영 |
+| Step 6 | 스킬 만들기 — 반복 작업 자동화 | `/ingest` `/query` `/lint` |
+| Step 7 | Graphify — 지식을 그래프로 | `graphify-out/` |
+
+### Karpathy LLM Wiki 핵심 규칙 10가지
+
+1. `raw/`는 절대 수정 금지 (불변 원본)
+2. wiki 페이지 생성/삭제 시 `index.md` 필수 업데이트
+3. 모든 오퍼레이션마다 `log.md`에 기록
+4. 내부 참조는 `[[wikilink]]` 형식
+5. 모든 wiki 페이지에 YAML frontmatter
+6. 모순 발견 시 양쪽 소스 모두 인용
+7. 소스 요약은 사실만, 해석은 개념 페이지에서
+8. 질의 시 `index.md` 먼저, `raw/`는 마지막 수단
+9. 새 페이지보다 기존 페이지 업데이트 우선
+10. index 항목은 한 줄, 120자 이내
+
+### 볼트 구조
+
+```
+볼트/
+├── CLAUDE.md              ← 나의 설명서 + 위키 운영 규칙
+├── 나의 핵심 맥락.md       ← 맥락 인터뷰 결과
+├── raw/                   ← 불변 원본 (수집한 자료, 절대 수정 금지)
+│   ├── articles/
+│   ├── videos/
+│   └── ...
+├── wiki/                  ← 가공된 지식 (AI가 편집)
+│   ├── index.md
+│   ├── log.md
+│   └── ...
+└── graphify-out/          ← 그래프 데이터 (Graphify 생성)
+    ├── graph.json
+    ├── graph.html
+    └── GRAPH_REPORT.md
+```
+
+### 핵심 스킬 명령
+
+**인제스트 (빠른 버전):**
+```
+raw/ 폴더를 스캔해서 아직 인제스트 안 된 파일을 모두 처리해줘.
+대화 없이 바로 wiki/에 반영하고, 끝나면 요약을 보여줘.
+```
+
+**스킬 생성 프롬프트:**
+- `/ingest` — 새 파일 스캔 + wiki 반영 + log 기록
+- `/query "질문"` — wiki 문서 기반 답변 (벡터DB 아님)
+- `/lint` — 깨진 링크·미업데이트 항목 찾아 수정
+
+**Graphify 실행:**
+```bash
+pip install graphifyy
+/graphify wiki/            # 전체 그래프 생성
+/graphify wiki/ --update   # 증분 업데이트 (토큰 절약)
+/graphify query "질문"     # 그래프 기반 관계형 질의
+```
+
+### 참고 링크
+
+- Karpathy LLM Wiki: https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f
+- Graphify: https://github.com/graphifyy/graphify
+- Obsidian Web Clipper: Chrome 웹스토어에서 "Obsidian Web Clipper" 검색
+
+---
+
+## 32. ckdshop / ckdshop2 구현 이력 (2026-07-17 기준)
+
+> 프로젝트 경로: `C:\Users\user\Desktop\ckdshop\` (8082/PostgreSQL/5173) | `C:\Users\user\Desktop\ckdshop2\` (8083/MySQL/5174)
+> **철저 분리 원칙**: 두 프로젝트 코드 절대 혼합 금지. 커밋·푸시도 별도로.
+
+### 공통 적용 기능 (양쪽 모두 구현 완료)
+
+| 기능 | 핵심 파일 | 커밋 |
+|---|---|---|
+| **회원 탈퇴 + 개인정보 익명화** | `Member.withdraw()`, `MemberService.withdraw()`, `DELETE /mypage/withdraw` | d2a446a / c991556 |
+| **탈퇴 회원 로그인 차단** | `MemberService.login()` — WITHDRAWN 상태 체크 | 동상 |
+| **탈퇴 다이얼로그 (프론트)** | `MyPageView.vue` — 비밀번호 확인 후 탈퇴 | 동상 |
+
+### ckdshop 전용 — 공통처리 종단관심사(AOP) 아키텍처 (2026-07-17)
+
+| 모듈 | 파일 | 역할 |
+|---|---|---|
+| **요청 로깅 필터** | `RequestLoggingFilter.java` (@Order 0) | MDC 상관 ID(X-Correlation-Id) 주입, 요청/응답 처리 시간 기록 |
+| **서비스 실행 시간 Aspect** | `LoggingAspect.java` | @Service 메서드 자동 측정, 500ms 초과 시 WARN |
+| **선언적 감사 로그** | `@AuditLog` + `AuditAspect.java` | 어노테이션만 붙이면 AuditLogService 자동 호출 |
+| **글로벌 예외 핸들러** | `GlobalExceptionHandler.java` | HttpStatus 전파, Spring Security 예외(401/403) 통합 처리 |
+| **에러 코드** | `ErrorCode.java` (37개) | 모든 코드에 HttpStatus 필드 추가 |
+| **비즈니스 예외** | `BusinessException.java` | ErrorCode에서 HttpStatus 자동 주입 |
+
+**필터 체인 순서**: `RequestLoggingFilter(@Order 0)` → `XssFilter(@Order 1)` → `RateLimitFilter(@Order 2)` → `JwtAuthFilter`
+
+### 핵심 제약 사항
+- 어드민 계정(`admin@ckdshop.com`) 비밀번호 임의 수정 금지
+- ckdshop2 포트: 백엔드 8083, 프론트엔드 5174 (ckdshop은 8082/5173)
 
 ---
 
