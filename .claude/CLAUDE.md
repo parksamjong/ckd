@@ -1301,7 +1301,8 @@ MySpider().start()
 - 직선·화살표·도형 자동 인식
 
 ### 설치 경로 (이 PC)
-- 실행 파일: 시작 메뉴 → ICanNote
+- 아이캔노트: `C:\ICanX\ICanNote\IcanNote.exe`
+- 아이캔레코더: `C:\ICanX\ICanNote\ICanRecorder.exe`
 - 지원 카페: https://cafe.naver.com/icannote
 
 ---
